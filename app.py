@@ -1,5 +1,5 @@
 import os
-import json
+import re
 from decimal import Decimal, InvalidOperation
 from urllib.parse import urlencode
 
@@ -18,9 +18,7 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 MELI_CLIENT_ID = os.environ.get("MELI_CLIENT_ID")
 MELI_CLIENT_SECRET = os.environ.get("MELI_CLIENT_SECRET")
 
-TELEGRAM_API = (
-    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
-)
+TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
 MELI_API = "https://api.mercadolibre.com"
 MELI_TOKEN_URL = f"{MELI_API}/oauth/token"
@@ -31,8 +29,6 @@ MELI_REDIRECT_URI = (
 
 SITE_ID = "MLB"
 
-# Token obtido pelo OAuth.
-# Ainda permanece em memória até adicionarmos persistência.
 meli_access_token = None
 meli_refresh_token = None
 
@@ -49,6 +45,7 @@ def brl(valor):
         numero = Decimal(str(valor))
 
         texto = f"{numero:,.2f}"
+
         texto = (
             texto
             .replace(",", "X")
@@ -62,46 +59,149 @@ def brl(valor):
         return str(valor)
 
 
-def calcular_desconto(preco, original):
-    try:
-        preco = Decimal(str(preco))
-        original = Decimal(str(original))
+def normalizar_texto(texto):
+    texto = str(texto or "").lower()
 
-        if original <= 0:
-            return None
-
-        if preco >= original:
-            return None
-
-        percentual = (
-            (original - preco)
-            / original
-            * Decimal("100")
-        )
-
-        return round(
-            float(percentual),
-            1
-        )
-
-    except Exception:
-        return None
-
-
-def traduzir_condicao(condicao):
-    mapa = {
-        "new": "Novo",
-        "used": "Usado",
-        "not_specified": "Não especificado",
+    trocas = {
+        "á": "a",
+        "à": "a",
+        "ã": "a",
+        "â": "a",
+        "é": "e",
+        "ê": "e",
+        "í": "i",
+        "ó": "o",
+        "ô": "o",
+        "õ": "o",
+        "ú": "u",
+        "ç": "c",
     }
 
-    return mapa.get(
-        condicao,
-        condicao or "Não informada"
+    for origem, destino in trocas.items():
+        texto = texto.replace(origem, destino)
+
+    texto = re.sub(
+        r"[^a-z0-9]+",
+        " ",
+        texto
+    )
+
+    return " ".join(
+        texto.split()
     )
 
 
-def cortar(texto, limite=3900):
+def tokens_busca(termo):
+    texto = normalizar_texto(
+        termo
+    )
+
+    ignorar = {
+        "apple",
+        "de",
+        "do",
+        "da",
+        "para",
+        "com",
+        "gb",
+        "ssd",
+        "ram",
+    }
+
+    tokens = []
+
+    for palavra in texto.split():
+        if palavra in ignorar:
+            continue
+
+        if len(palavra) < 2:
+            continue
+
+        tokens.append(
+            palavra
+        )
+
+    return tokens
+
+
+def score_produto(
+    nome,
+    termo
+):
+    nome_norm = normalizar_texto(
+        nome
+    )
+
+    tokens = tokens_busca(
+        termo
+    )
+
+    score = 0
+
+    for token in tokens:
+        if token in nome_norm:
+            score += 10
+
+    # penalizações para resultados claramente ruins
+    palavras_ruins = [
+        "suporte",
+        "hub",
+        "case",
+        "adaptador",
+        "parede",
+        "capa",
+        "dock",
+        "teclado",
+        "mouse",
+    ]
+
+    for ruim in palavras_ruins:
+        if ruim in nome_norm:
+            score -= 100
+
+    # se busca contém m4, penaliza M2/M1/M3
+    termo_norm = normalizar_texto(
+        termo
+    )
+
+    if "m4" in termo_norm:
+        for antigo in [
+            "m1",
+            "m2",
+            "m3",
+        ]:
+            if antigo in nome_norm:
+                score -= 80
+
+    # se busca pede 512
+    if "512" in termo_norm:
+        if "512" in nome_norm:
+            score += 25
+
+        if "256" in nome_norm:
+            score -= 50
+
+        if "1 tb" in nome_norm:
+            score -= 30
+
+    # se busca pede 16
+    if "16" in termo_norm:
+        if "16" in nome_norm:
+            score += 20
+
+        if "24" in nome_norm:
+            score -= 25
+
+        if "32" in nome_norm:
+            score -= 25
+
+    return score
+
+
+def cortar(
+    texto,
+    limite=3900
+):
     texto = str(texto)
 
     if len(texto) <= limite:
@@ -114,52 +214,33 @@ def cortar(texto, limite=3900):
 # TELEGRAM
 # =========================================================
 
-def send_message(chat_id, texto):
-    if not TELEGRAM_TOKEN:
-        print("TELEGRAM_BOT_TOKEN ausente.")
-        return False
-
+def send_message(
+    chat_id,
+    texto
+):
     try:
         response = requests.post(
             f"{TELEGRAM_API}/sendMessage",
             json={
                 "chat_id": chat_id,
                 "text": cortar(texto),
-                "disable_web_page_preview": True,
+                "disable_web_page_preview": False,
             },
             timeout=20,
         )
 
-        return response.status_code == 200
+        return (
+            response.status_code
+            == 200
+        )
 
-    except requests.RequestException as exc:
+    except Exception as exc:
         print(
-            "Erro ao enviar Telegram:",
+            "Erro Telegram:",
             exc
         )
 
         return False
-
-
-def enviar_texto_grande(
-    chat_id,
-    texto,
-    limite=3800
-):
-    texto = str(texto)
-
-    for inicio in range(
-        0,
-        len(texto),
-        limite
-    ):
-        send_message(
-            chat_id,
-            texto[
-                inicio:
-                inicio + limite
-            ]
-        )
 
 
 # =========================================================
@@ -183,16 +264,15 @@ def home():
 
 @app.route("/oauth/login")
 def oauth_login():
-    if not MELI_CLIENT_ID:
-        return (
-            "MELI_CLIENT_ID não configurado.",
-            500
-        )
-
     parametros = {
-        "response_type": "code",
-        "client_id": MELI_CLIENT_ID,
-        "redirect_uri": MELI_REDIRECT_URI,
+        "response_type":
+            "code",
+
+        "client_id":
+            MELI_CLIENT_ID,
+
+        "redirect_uri":
+            MELI_REDIRECT_URI,
     }
 
     url = (
@@ -209,7 +289,9 @@ def oauth_callback():
     global meli_access_token
     global meli_refresh_token
 
-    code = request.args.get("code")
+    code = request.args.get(
+        "code"
+    )
 
     if not code:
         return (
@@ -239,12 +321,9 @@ def oauth_callback():
             timeout=25,
         )
 
-        try:
-            data = response.json()
-        except Exception:
-            data = {}
+        data = response.json()
 
-    except requests.RequestException as exc:
+    except Exception as exc:
         return (
             f"Erro OAuth: {exc}",
             500
@@ -252,11 +331,10 @@ def oauth_callback():
 
     if response.status_code != 200:
         return (
-            "❌ Não foi possível gerar "
-            "o Access Token.<br><br>"
-            f"HTTP {response.status_code}<br>"
+            "Erro OAuth HTTP "
+            f"{response.status_code}<br><br>"
             f"{data}",
-            400,
+            400
         )
 
     meli_access_token = (
@@ -277,13 +355,13 @@ def oauth_callback():
         "✅ Mercado Livre conectado!"
         "<br><br>"
         "Volte ao Telegram e envie "
-        "<b>/teste</b>.",
-        200,
+        "<b>/buscar Mac Mini M4 16 512</b>",
+        200
     )
 
 
 # =========================================================
-# REFRESH TOKEN
+# TOKEN
 # =========================================================
 
 def renovar_access_token():
@@ -320,19 +398,19 @@ def renovar_access_token():
     if response.status_code != 200:
         return False
 
-    novo_access_token = (
-        data.get("access_token")
+    novo_access = data.get(
+        "access_token"
     )
 
-    if not novo_access_token:
+    if not novo_access:
         return False
 
     meli_access_token = (
-        novo_access_token
+        novo_access
     )
 
-    novo_refresh = (
-        data.get("refresh_token")
+    novo_refresh = data.get(
+        "refresh_token"
     )
 
     if novo_refresh:
@@ -344,21 +422,19 @@ def renovar_access_token():
 
 
 # =========================================================
-# REQUEST MERCADO LIVRE
+# API MERCADO LIVRE
 # =========================================================
 
 def meli_get(
     endpoint,
     params=None,
-    tentar_refresh=True
+    refresh=True
 ):
     if not meli_access_token:
         return {
             "ok": False,
             "status": None,
             "data": {},
-            "message":
-                "Mercado Livre não autorizado.",
         }
 
     try:
@@ -378,29 +454,24 @@ def meli_get(
         try:
             data = response.json()
         except Exception:
-            data = {
-                "raw":
-                    response.text[:2000]
-            }
+            data = {}
 
-    except requests.RequestException as exc:
+    except requests.RequestException:
         return {
             "ok": False,
             "status": None,
             "data": {},
-            "message": str(exc),
         }
 
-    # Token expirado
     if (
         response.status_code == 401
-        and tentar_refresh
+        and refresh
         and renovar_access_token()
     ):
         return meli_get(
             endpoint,
             params=params,
-            tentar_refresh=False
+            refresh=False
         )
 
     return {
@@ -416,106 +487,65 @@ def meli_get(
 
 
 # =========================================================
-# ERROS
-# =========================================================
-
-def formatar_erro(resultado):
-    status = resultado.get("status")
-    data = resultado.get("data") or {}
-
-    linhas = [
-        "❌ MERCADO LIVRE",
-        "",
-        f"HTTP: {status}",
-    ]
-
-    if isinstance(data, dict):
-        if data.get("error"):
-            linhas.append(
-                f"error: {data.get('error')}"
-            )
-
-        if data.get("message"):
-            linhas.append(
-                f"message: {data.get('message')}"
-            )
-
-        if data.get("cause"):
-            try:
-                linhas.append(
-                    "cause: "
-                    + json.dumps(
-                        data.get("cause"),
-                        ensure_ascii=False
-                    )[:800]
-                )
-            except Exception:
-                pass
-
-    if resultado.get("message"):
-        linhas.append(
-            resultado.get("message")
-        )
-
-    return "\n".join(linhas)
-
-
-# =========================================================
 # CATÁLOGO
 # =========================================================
 
-def pesquisar_produtos(
+def pesquisar_catalogo(
     termo,
     limite=20
 ):
     return meli_get(
         "/products/search",
         params={
-            "site_id": SITE_ID,
-            "status": "active",
-            "q": termo,
-            "limit": limite,
+            "site_id":
+                SITE_ID,
+
+            "status":
+                "active",
+
+            "q":
+                termo,
+
+            "limit":
+                limite,
         },
     )
 
 
-def obter_produto(
-    product_id
-):
-    return meli_get(
-        f"/products/{product_id}"
-    )
-
-
 # =========================================================
-# OFERTAS COMERCIAIS
+# OFERTAS
 # =========================================================
 
-def obter_ofertas_produto(
+def obter_ofertas(
     product_id
 ):
-    """
-    Esta é a rota que já comprovamos
-    na sua aplicação com HTTP 200.
-    """
-
     return meli_get(
         f"/products/{product_id}/items"
     )
 
 
-def extrair_lista_ofertas(
+def extrair_ofertas(
     resultado
 ):
-    if not resultado.get("ok"):
+    if not resultado.get(
+        "ok"
+    ):
         return []
 
-    data = resultado.get("data")
+    data = resultado.get(
+        "data"
+    )
 
-    if isinstance(data, list):
+    if isinstance(
+        data,
+        list
+    ):
         return data
 
-    if not isinstance(data, dict):
+    if not isinstance(
+        data,
+        dict
+    ):
         return []
 
     for chave in [
@@ -523,186 +553,288 @@ def extrair_lista_ofertas(
         "items",
         "offers",
     ]:
-        valor = data.get(chave)
+        valor = data.get(
+            chave
+        )
 
-        if isinstance(valor, list):
+        if isinstance(
+            valor,
+            list
+        ):
             return valor
 
     return []
 
 
 # =========================================================
-# NORMALIZAÇÃO
+# BUSCA COMPLETA
 # =========================================================
 
-def normalizar_oferta(
-    item
+def buscar_ofertas_completas(
+    termo
 ):
-    if not isinstance(item, dict):
-        return None
+    resultado = pesquisar_catalogo(
+        termo,
+        limite=20
+    )
 
-    shipping = (
-        item.get("shipping")
-        if isinstance(
-            item.get("shipping"),
-            dict
+    if not resultado.get(
+        "ok"
+    ):
+        return {
+            "ok": False,
+            "status":
+                resultado.get("status"),
+            "ofertas": [],
+        }
+
+    produtos = (
+        resultado
+        .get("data", {})
+        .get("results", [])
+    )
+
+    produtos_rank = []
+
+    for produto in produtos:
+        nome = (
+            produto.get("name")
+            or produto.get("title")
+            or ""
         )
-        else {}
-    )
 
-    seller_address = (
-        item.get("seller_address")
-        if isinstance(
-            item.get("seller_address"),
-            dict
+        score = score_produto(
+            nome,
+            termo
         )
-        else {}
-    )
 
-    cidade = (
-        seller_address
-        .get("city", {})
-        .get("name")
-        if isinstance(
-            seller_address.get("city"),
-            dict
+        if score <= 0:
+            continue
+
+        produtos_rank.append(
+            (
+                score,
+                produto
+            )
         )
-        else None
+
+    produtos_rank.sort(
+        key=lambda x: x[0],
+        reverse=True
     )
 
-    estado = (
-        seller_address
-        .get("state", {})
-        .get("name")
-        if isinstance(
-            seller_address.get("state"),
-            dict
+    # Consulta apenas os melhores produtos
+    produtos_rank = (
+        produtos_rank[:5]
+    )
+
+    ofertas_finais = []
+
+    for score, produto in produtos_rank:
+        product_id = produto.get(
+            "id"
         )
-        else None
+
+        nome_produto = (
+            produto.get("name")
+            or produto.get("title")
+            or "Produto"
+        )
+
+        if not product_id:
+            continue
+
+        resultado_ofertas = (
+            obter_ofertas(
+                product_id
+            )
+        )
+
+        itens = extrair_ofertas(
+            resultado_ofertas
+        )
+
+        for item in itens:
+            if not isinstance(
+                item,
+                dict
+            ):
+                continue
+
+            preco = item.get(
+                "price"
+            )
+
+            if preco is None:
+                continue
+
+            shipping = (
+                item.get("shipping")
+                if isinstance(
+                    item.get("shipping"),
+                    dict
+                )
+                else {}
+            )
+
+            seller_address = (
+                item.get(
+                    "seller_address"
+                )
+                if isinstance(
+                    item.get(
+                        "seller_address"
+                    ),
+                    dict
+                )
+                else {}
+            )
+
+            cidade = None
+            estado = None
+
+            if isinstance(
+                seller_address.get(
+                    "city"
+                ),
+                dict
+            ):
+                cidade = (
+                    seller_address
+                    ["city"]
+                    .get("name")
+                )
+
+            if isinstance(
+                seller_address.get(
+                    "state"
+                ),
+                dict
+            ):
+                estado = (
+                    seller_address
+                    ["state"]
+                    .get("name")
+                )
+
+            ofertas_finais.append(
+                {
+                    "product_id":
+                        product_id,
+
+                    "product_name":
+                        nome_produto,
+
+                    "item_id":
+                        item.get(
+                            "item_id"
+                        ),
+
+                    "seller_id":
+                        item.get(
+                            "seller_id"
+                        ),
+
+                    "price":
+                        preco,
+
+                    "original_price":
+                        item.get(
+                            "original_price"
+                        ),
+
+                    "condition":
+                        item.get(
+                            "condition"
+                        ),
+
+                    "listing_type":
+                        item.get(
+                            "listing_type_id"
+                        ),
+
+                    "warranty":
+                        item.get(
+                            "warranty"
+                        ),
+
+                    "mercadopago":
+                        item.get(
+                            "accepts_mercadopago"
+                        ),
+
+                    "free_shipping":
+                        shipping.get(
+                            "free_shipping"
+                        ),
+
+                    "shipping_cost":
+                        shipping.get(
+                            "cost"
+                        ),
+
+                    "city":
+                        cidade,
+
+                    "state":
+                        estado,
+
+                    "deal_ids":
+                        item.get(
+                            "deal_ids"
+                        ) or [],
+
+                    "score":
+                        score,
+                }
+            )
+
+    # remove duplicados por item_id
+    unicos = {}
+
+    for oferta in ofertas_finais:
+        item_id = oferta.get(
+            "item_id"
+        )
+
+        if item_id:
+            unicos[item_id] = (
+                oferta
+            )
+
+    ofertas_finais = list(
+        unicos.values()
     )
 
-    preco = item.get("price")
-    original = item.get(
-        "original_price"
+    # ordena primeiro por aderência ao produto,
+    # depois por menor preço
+    ofertas_finais.sort(
+        key=lambda x: (
+            -x.get("score", 0),
+            Decimal(
+                str(
+                    x.get(
+                        "price",
+                        999999999
+                    )
+                )
+            )
+        )
     )
-
-    desconto = calcular_desconto(
-        preco,
-        original
-    )
-
-    deal_ids = item.get(
-        "deal_ids"
-    ) or []
 
     return {
-        "item_id":
-            item.get("item_id")
-            or item.get("id"),
-
-        "seller_id":
-            item.get("seller_id"),
-
-        "price":
-            preco,
-
-        "original_price":
-            original,
-
-        "discount":
-            desconto,
-
-        "currency":
-            item.get("currency_id"),
-
-        "condition":
-            item.get("condition"),
-
-        "listing_type":
-            item.get("listing_type_id"),
-
-        "warranty":
-            item.get("warranty"),
-
-        "official_store_id":
-            item.get("official_store_id"),
-
-        "mercadopago":
-            item.get(
-                "accepts_mercadopago"
-            ),
-
-        "free_shipping":
-            shipping.get(
-                "free_shipping"
-            ),
-
-        "shipping_cost":
-            shipping.get("cost"),
-
-        "logistic_type":
-            shipping.get(
-                "logistic_type"
-            ),
-
-        "city":
-            cidade,
-
-        "state":
-            estado,
-
-        "deal_ids":
-            deal_ids,
-
-        "tags":
-            item.get("tags") or [],
-
-        "user_product_id":
-            item.get(
-                "user_product_id"
-            ),
-
-        "min_purchase_unit":
-            item.get(
-                "min_purchase_unit"
-            ) or 1,
-
-        "raw":
-            item,
+        "ok": True,
+        "status": 200,
+        "ofertas":
+            ofertas_finais,
     }
 
 
 # =========================================================
-# RANKING
+# FORMATAÇÃO
 # =========================================================
 
-def preco_numerico(
-    oferta
-):
-    try:
-        return Decimal(
-            str(oferta.get("price"))
-        )
-    except Exception:
-        return Decimal(
-            "999999999999"
-        )
-
-
-def ordenar_ofertas(
-    ofertas
-):
-    return sorted(
-        ofertas,
-        key=preco_numerico
-    )
-
-
-# =========================================================
-# FORMATAÇÃO DE OFERTA
-# =========================================================
-
-def formatar_oferta(
+def montar_card(
     oferta,
     posicao
 ):
@@ -710,7 +842,7 @@ def formatar_oferta(
 
     if posicao == 1:
         linhas.append(
-            "🏆 MELHOR PREÇO ENCONTRADO"
+            "🏆 MELHOR OFERTA"
         )
     else:
         linhas.append(
@@ -720,135 +852,169 @@ def formatar_oferta(
     linhas.append("")
 
     linhas.append(
-        f"💰 Preço atual: "
-        f"{brl(oferta.get('price'))}"
+        "💻 "
+        + oferta.get(
+            "product_name",
+            "Produto"
+        )
+    )
+
+    linhas.append("")
+
+    linhas.append(
+        "💰 "
+        + brl(
+            oferta.get(
+                "price"
+            )
+        )
     )
 
     original = oferta.get(
         "original_price"
     )
 
-    if original is not None:
+    if original:
         linhas.append(
-            f"Preço anterior: {brl(original)}"
+            "De: "
+            + brl(
+                original
+            )
         )
 
-    desconto = oferta.get(
-        "discount"
-    )
+        try:
+            atual = Decimal(
+                str(
+                    oferta.get(
+                        "price"
+                    )
+                )
+            )
 
-    if desconto is not None:
-        linhas.append(
-            f"🔥 Desconto: {desconto}%"
-        )
+            antigo = Decimal(
+                str(original)
+            )
 
-    # IMPORTANTE:
-    # Não inventar parcelas.
-    # Este endpoint não retornou
-    # installments no seu JSON.
+            if (
+                antigo > 0
+                and atual < antigo
+            ):
+                desconto = (
+                    (
+                        antigo - atual
+                    )
+                    / antigo
+                    * 100
+                )
+
+                linhas.append(
+                    "🔥 "
+                    f"{desconto:.1f}% OFF"
+                )
+
+        except Exception:
+            pass
+
+    # A API liberada ainda não retornou installments.
     linhas.append(
         "💳 Parcelamento: "
-        "não informado por esta rota da API"
+        "não informado pela API"
     )
 
-    if oferta.get("free_shipping"):
+    if oferta.get(
+        "free_shipping"
+    ):
         linhas.append(
             "🚚 Frete grátis"
         )
-    else:
-        custo = oferta.get(
-            "shipping_cost"
-        )
 
-        if custo is not None:
-            linhas.append(
-                f"🚚 Frete: {brl(custo)}"
-            )
-
-    linhas.append(
-        "📦 Condição: "
-        + traduzir_condicao(
-            oferta.get("condition")
-        )
+    condicao = oferta.get(
+        "condition"
     )
 
-    if oferta.get("warranty"):
+    if condicao == "new":
         linhas.append(
-            "🛡 Garantia: "
-            + str(
-                oferta.get("warranty")
-            )
+            "📦 Novo"
         )
 
-    if oferta.get(
-        "official_store_id"
-    ):
+    elif condicao == "used":
         linhas.append(
-            "🏪 Loja oficial"
+            "📦 Usado"
         )
 
-    if oferta.get("mercadopago"):
+    garantia = oferta.get(
+        "warranty"
+    )
+
+    if garantia:
         linhas.append(
-            "💙 Mercado Pago aceito"
+            "🛡 "
+            + garantia
         )
 
     local = []
 
-    if oferta.get("city"):
+    if oferta.get(
+        "city"
+    ):
         local.append(
-            oferta.get("city")
+            oferta.get(
+                "city"
+            )
         )
 
-    if oferta.get("state"):
+    if oferta.get(
+        "state"
+    ):
         local.append(
-            oferta.get("state")
+            oferta.get(
+                "state"
+            )
         )
 
     if local:
         linhas.append(
-            "📍 Vendedor: "
-            + " - ".join(local)
-        )
-
-    if oferta.get("seller_id"):
-        linhas.append(
-            "👤 Seller ID: "
-            f"{oferta.get('seller_id')}"
-        )
-
-    if oferta.get("listing_type"):
-        linhas.append(
-            "📋 Tipo do anúncio: "
-            f"{oferta.get('listing_type')}"
-        )
-
-    deal_ids = oferta.get(
-        "deal_ids"
-    )
-
-    if deal_ids:
-        linhas.append(
-            "🔥 Promoção/deal detectado: "
-            + ", ".join(
-                map(str, deal_ids)
+            "📍 "
+            + " - ".join(
+                local
             )
         )
 
-    linhas.append(
-        "🎟 Cupom: "
-        "não informado por esta rota"
-    )
+    if oferta.get(
+        "seller_id"
+    ):
+        linhas.append(
+            "👤 Vendedor: "
+            + str(
+                oferta.get(
+                    "seller_id"
+                )
+            )
+        )
+
+    if oferta.get(
+        "deal_ids"
+    ):
+        linhas.append(
+            "🔥 Promoção detectada"
+        )
 
     linhas.append(
-        f"🆔 Item: "
-        f"{oferta.get('item_id')}"
+        "🆔 "
+        + str(
+            oferta.get(
+                "item_id"
+            )
+        )
     )
 
-    return "\n".join(linhas)
+    return "\n".join(
+        linhas
+    )
 
 
 # =========================================================
-# COMANDO /BUSCAR
+# COMANDO BUSCAR
 # =========================================================
 
 def comando_buscar(
@@ -857,152 +1023,40 @@ def comando_buscar(
 ):
     send_message(
         chat_id,
-        "🔎 Procurando produtos...\n\n"
-        f"{termo}"
+        "🔎 GARIMPANDO...\n\n"
+        f"{termo}\n\n"
+        "Buscando produtos e "
+        "ofertas comerciais..."
     )
 
-    resultado = pesquisar_produtos(
-        termo,
-        limite=20
-    )
-
-    if not resultado.get("ok"):
-        send_message(
-            chat_id,
-            formatar_erro(
-                resultado
-            )
+    resultado = (
+        buscar_ofertas_completas(
+            termo
         )
-
-        return
-
-    data = resultado.get(
-        "data",
-        {}
     )
 
-    produtos = data.get(
-        "results",
-        []
-    )
-
-    if not produtos:
-        send_message(
-            chat_id,
-            "Nenhum produto encontrado."
-        )
-
-        return
-
-    linhas = [
-        "📦 PRODUTOS ENCONTRADOS",
-        "",
-    ]
-
-    for indice, produto in enumerate(
-        produtos[:20],
-        start=1
+    if not resultado.get(
+        "ok"
     ):
-        product_id = produto.get("id")
-
-        nome = (
-            produto.get("name")
-            or produto.get("title")
-            or "Produto"
-        )
-
-        linhas.append(
-            f"{indice}. {nome}"
-        )
-
-        linhas.append(
-            f"ID: {product_id}"
-        )
-
-        linhas.append(
-            f"/ofertas {product_id}"
-        )
-
-        linhas.append("")
-
-    enviar_texto_grande(
-        chat_id,
-        "\n".join(linhas)
-    )
-
-
-# =========================================================
-# COMANDO /OFERTAS
-# =========================================================
-
-def comando_ofertas(
-    chat_id,
-    product_id
-):
-    product_id = (
-        product_id
-        .strip()
-        .upper()
-    )
-
-    send_message(
-        chat_id,
-        "🕵️ Garimpando ofertas reais...\n\n"
-        f"Produto: {product_id}"
-    )
-
-    resultado = obter_ofertas_produto(
-        product_id
-    )
-
-    if not resultado.get("ok"):
         send_message(
             chat_id,
-            formatar_erro(
-                resultado
-            )
+            "❌ A busca falhou.\n\n"
+            f"HTTP: "
+            f"{resultado.get('status')}"
         )
 
         return
 
-    itens = extrair_lista_ofertas(
-        resultado
-    )
-
-    if not itens:
-        send_message(
-            chat_id,
-            "A API respondeu HTTP 200, "
-            "mas não retornou ofertas."
-        )
-
-        return
-
-    ofertas = []
-
-    for item in itens:
-        oferta = normalizar_oferta(
-            item
-        )
-
-        if (
-            oferta
-            and oferta.get("price")
-            is not None
-        ):
-            ofertas.append(
-                oferta
-            )
-
-    ofertas = ordenar_ofertas(
-        ofertas
+    ofertas = resultado.get(
+        "ofertas",
+        []
     )
 
     if not ofertas:
         send_message(
             chat_id,
-            "Nenhuma oferta com preço "
-            "foi encontrada."
+            "❌ Não encontrei "
+            "ofertas comerciais compatíveis."
         )
 
         return
@@ -1010,70 +1064,24 @@ def comando_ofertas(
     send_message(
         chat_id,
         "✅ GARIMPO CONCLUÍDO\n\n"
-        f"Ofertas encontradas: "
-        f"{len(ofertas)}\n\n"
-        "Ordenadas do menor "
-        "para o maior preço."
+        f"{len(ofertas)} oferta(s) "
+        "compatível(is) encontrada(s).\n\n"
+        "Mostrando as melhores:"
     )
 
+    # Telegram ficaria enorme se mostramos tudo.
+    # Limite visual inicial: 10 melhores.
     for indice, oferta in enumerate(
-        ofertas[:20],
+        ofertas[:10],
         start=1
     ):
         send_message(
             chat_id,
-            formatar_oferta(
+            montar_card(
                 oferta,
                 indice
             )
         )
-
-
-# =========================================================
-# RAW
-# =========================================================
-
-def comando_raw(
-    chat_id,
-    product_id
-):
-    resultado = obter_ofertas_produto(
-        product_id
-    )
-
-    if not resultado.get("ok"):
-        send_message(
-            chat_id,
-            formatar_erro(resultado)
-        )
-
-        return
-
-    itens = extrair_lista_ofertas(
-        resultado
-    )
-
-    if not itens:
-        send_message(
-            chat_id,
-            "Nenhuma oferta retornada."
-        )
-
-        return
-
-    primeiro = itens[0]
-
-    texto = json.dumps(
-        primeiro,
-        ensure_ascii=False,
-        indent=2
-    )
-
-    enviar_texto_grande(
-        chat_id,
-        "🔬 PRIMEIRA OFERTA — JSON\n\n"
-        + texto
-    )
 
 
 # =========================================================
@@ -1087,10 +1095,13 @@ def comando_teste(
         "/users/me"
     )
 
-    if not resultado.get("ok"):
+    if not resultado.get(
+        "ok"
+    ):
         send_message(
             chat_id,
-            formatar_erro(resultado)
+            "❌ Mercado Livre "
+            "não autenticado."
         )
 
         return
@@ -1105,13 +1116,14 @@ def comando_teste(
         "✅ AUTENTICAÇÃO OK\n\n"
         f"HTTP: "
         f"{resultado.get('status')}\n"
-        f"User ID: {data.get('id')}\n"
+        f"User ID: "
+        f"{data.get('id')}\n"
         f"Nickname: "
         f"{data.get('nickname')}\n"
-        f"Site: {data.get('site_id')}\n\n"
+        f"Site: "
+        f"{data.get('site_id')}\n\n"
         "✅ OAuth válido\n"
-        "✅ Access Token válido\n"
-        "✅ API Mercado Livre acessível"
+        "✅ API acessível"
     )
 
 
@@ -1151,28 +1163,28 @@ def webhook():
     if not chat_id:
         return "OK", 200
 
-    # -----------------------------------------------------
-
-    if text.startswith("/start"):
+    if text.startswith(
+        "/start"
+    ):
         send_message(
             chat_id,
             "🤖 GARIMPEIRO PESSOAL\n\n"
-            "Mercado Livre conectado.\n\n"
-            "Comandos:\n\n"
+            "Agora a busca já procura "
+            "as ofertas automaticamente.\n\n"
+            "Exemplo:\n"
+            "/buscar Mac Mini M4 16 512\n\n"
+            "Outros comandos:\n"
             "/status\n"
-            "/teste\n"
-            "/buscar Mac Mini M4 16 512\n"
-            "/ofertas MLB74895216\n"
-            "/raw MLB74895216"
+            "/teste"
         )
 
-    # -----------------------------------------------------
-
-    elif text.startswith("/status"):
+    elif text.startswith(
+        "/status"
+    ):
         mercado = (
             "✅ conectado"
             if meli_access_token
-            else "⚠️ aguardando OAuth"
+            else "⚠️ não autorizado"
         )
 
         send_message(
@@ -1180,16 +1192,17 @@ def webhook():
             "🤖 STATUS\n\n"
             "✅ Telegram\n"
             "✅ Render\n"
-            f"Mercado Livre: {mercado}"
+            f"Mercado Livre: "
+            f"{mercado}"
         )
 
-    # -----------------------------------------------------
-
-    elif text.startswith("/teste"):
+    elif text.startswith(
+        "/teste"
+    ):
         if not meli_access_token:
             send_message(
                 chat_id,
-                "⚠️ Autorize o Mercado Livre:\n\n"
+                "⚠️ Autorize:\n"
                 "https://garimpeiro-pessoal."
                 "onrender.com/oauth/login"
             )
@@ -1199,14 +1212,17 @@ def webhook():
                 chat_id
             )
 
-    # -----------------------------------------------------
-
-    elif text.startswith("/buscar"):
+    elif text.startswith(
+        "/buscar"
+    ):
         if not meli_access_token:
             send_message(
                 chat_id,
                 "⚠️ Mercado Livre "
-                "não autorizado."
+                "não autorizado.\n\n"
+                "Abra:\n"
+                "https://garimpeiro-pessoal."
+                "onrender.com/oauth/login"
             )
 
             return "OK", 200
@@ -1218,7 +1234,7 @@ def webhook():
         if len(partes) < 2:
             send_message(
                 chat_id,
-                "Exemplo:\n"
+                "Use, por exemplo:\n"
                 "/buscar Mac Mini M4 16 512"
             )
 
@@ -1228,71 +1244,11 @@ def webhook():
                 partes[1]
             )
 
-    # -----------------------------------------------------
-
-    elif text.startswith("/ofertas"):
-        if not meli_access_token:
-            send_message(
-                chat_id,
-                "⚠️ Mercado Livre "
-                "não autorizado."
-            )
-
-            return "OK", 200
-
-        partes = text.split(
-            maxsplit=1
-        )
-
-        if len(partes) < 2:
-            send_message(
-                chat_id,
-                "Exemplo:\n"
-                "/ofertas MLB74895216"
-            )
-
-        else:
-            comando_ofertas(
-                chat_id,
-                partes[1]
-            )
-
-    # -----------------------------------------------------
-
-    elif text.startswith("/raw"):
-        if not meli_access_token:
-            send_message(
-                chat_id,
-                "⚠️ Mercado Livre "
-                "não autorizado."
-            )
-
-            return "OK", 200
-
-        partes = text.split(
-            maxsplit=1
-        )
-
-        if len(partes) < 2:
-            send_message(
-                chat_id,
-                "Exemplo:\n"
-                "/raw MLB74895216"
-            )
-
-        else:
-            comando_raw(
-                chat_id,
-                partes[1]
-            )
-
-    # -----------------------------------------------------
-
     else:
         send_message(
             chat_id,
-            "🤖 Comando não reconhecido.\n\n"
-            "Envie /start."
+            "🤖 Envie uma busca assim:\n\n"
+            "/buscar Mac Mini M4 16 512"
         )
 
     return "OK", 200
