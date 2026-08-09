@@ -26,7 +26,6 @@ MELI_REDIRECT_URI = (
 
 MELI_TOKEN_URL = "https://api.mercadolibre.com/oauth/token"
 
-# Temporário: fica na memória do servidor.
 meli_access_token = None
 meli_refresh_token = None
 
@@ -49,7 +48,7 @@ def home():
 
 
 # =========================
-# LOGIN MERCADO LIVRE
+# OAUTH MERCADO LIVRE
 # =========================
 
 @app.route("/oauth/login")
@@ -63,10 +62,6 @@ def oauth_login():
 
     return redirect(authorization_url)
 
-
-# =========================
-# CALLBACK / ACCESS TOKEN
-# =========================
 
 @app.route("/oauth/callback")
 def oauth_callback():
@@ -92,7 +87,6 @@ def oauth_callback():
             data=payload,
             timeout=20,
         )
-
         data = response.json()
 
     except Exception:
@@ -114,81 +108,27 @@ def oauth_callback():
     return (
         "✅ Mercado Livre conectado ao Garimpeiro Pessoal!<br><br>"
         "🔐 Access Token recebido pelo servidor.<br>"
-        "🤖 Agora teste /teste no Telegram.",
+        "🤖 Agora você pode usar /buscar e /detalhe.",
         200,
     )
 
 
 # =========================
-# TESTE DO TOKEN
+# API AUXILIAR
 # =========================
 
-def testar_usuario_meli():
+def meli_get(url, params=None):
     if not meli_access_token:
         return {
             "ok": False,
             "status": None,
+            "data": {},
             "erro": "Mercado Livre não autorizado.",
         }
-
-    url = "https://api.mercadolibre.com/users/me"
 
     headers = {
         "Authorization": f"Bearer {meli_access_token}",
         "Accept": "application/json",
-    }
-
-    try:
-        response = requests.get(
-            url,
-            headers=headers,
-            timeout=20,
-        )
-    except requests.RequestException as exc:
-        return {
-            "ok": False,
-            "status": None,
-            "erro": f"Falha de conexão: {str(exc)[:200]}",
-        }
-
-    try:
-        data = response.json()
-    except Exception:
-        data = {
-            "raw_response": response.text[:1000]
-        }
-
-    return {
-        "ok": response.status_code == 200,
-        "status": response.status_code,
-        "data": data,
-    }
-
-
-# =========================
-# BUSCA / DIAGNÓSTICO
-# =========================
-
-def buscar_produto_meli(termo):
-    if not meli_access_token:
-        return {
-            "ok": False,
-            "status": None,
-            "erro": "Mercado Livre não autorizado.",
-        }
-
-    url = "https://api.mercadolibre.com/products/search"
-
-    headers = {
-        "Authorization": f"Bearer {meli_access_token}",
-        "Accept": "application/json",
-    }
-
-    params = {
-        "status": "active",
-        "site_id": "MLB",
-        "q": termo,
-        "limit": 5,
     }
 
     try:
@@ -198,18 +138,20 @@ def buscar_produto_meli(termo):
             params=params,
             timeout=20,
         )
+
     except requests.RequestException as exc:
         return {
             "ok": False,
             "status": None,
-            "erro": f"Falha de conexão: {str(exc)[:200]}",
+            "data": {},
+            "erro": str(exc),
         }
 
     try:
         data = response.json()
     except Exception:
         data = {
-            "raw_response": response.text[:1000]
+            "raw_response": response.text[:1500]
         }
 
     return {
@@ -219,51 +161,133 @@ def buscar_produto_meli(termo):
     }
 
 
-def formatar_erro_api(status, data):
-    linhas = [
-        "❌ MERCADO LIVRE RECUSOU A CONSULTA",
-        "",
-        f"HTTP: {status}",
-    ]
+# =========================
+# TESTE TOKEN
+# =========================
+
+def testar_usuario_meli():
+    return meli_get(
+        "https://api.mercadolibre.com/users/me"
+    )
+
+
+# =========================
+# BUSCA DE PRODUTOS
+# =========================
+
+def buscar_produto_meli(termo):
+    return meli_get(
+        "https://api.mercadolibre.com/products/search",
+        params={
+            "status": "active",
+            "site_id": "MLB",
+            "q": termo,
+            "limit": 5,
+        },
+    )
+
+
+# =========================
+# DETALHE DO PRODUTO
+# =========================
+
+def detalhe_produto_meli(product_id):
+    return meli_get(
+        f"https://api.mercadolibre.com/products/{product_id}"
+    )
+
+
+def formatar_erro(status, data):
+    message = ""
 
     if isinstance(data, dict):
-        error = data.get("error")
-        message = data.get("message")
-        cause = data.get("cause")
+        message = data.get("message", "")
+        error = data.get("error", "")
 
         if error:
-            linhas.append(f"error: {error}")
+            message += f"\nerror: {error}"
 
-        if message:
-            linhas.append(f"message: {message}")
+    return (
+        "❌ ERRO NA API DO MERCADO LIVRE\n\n"
+        f"HTTP: {status}\n"
+        f"{message}"
+    )
 
-        if cause:
-            texto_cause = json.dumps(
-                cause,
-                ensure_ascii=False
+
+def formatar_detalhe(product_id, data):
+    nome = (
+        data.get("name")
+        or data.get("title")
+        or "Produto"
+    )
+
+    linhas = [
+        "📦 DETALHES DO PRODUTO",
+        "",
+        f"Produto: {nome}",
+        f"ID: {product_id}",
+    ]
+
+    status = data.get("status")
+    if status:
+        linhas.append(f"Status: {status}")
+
+    catalog_product_id = data.get("catalog_product_id")
+    if catalog_product_id:
+        linhas.append(
+            f"Catalog ID: {catalog_product_id}"
+        )
+
+    buy_box = data.get("buy_box_winner")
+
+    if isinstance(buy_box, dict):
+        linhas.append("")
+        linhas.append("🏆 OFERTA PRINCIPAL ENCONTRADA")
+
+        price = buy_box.get("price")
+        currency = buy_box.get("currency_id")
+        item_id = buy_box.get("item_id")
+        condition = buy_box.get("condition")
+
+        if price is not None:
+            linhas.append(
+                f"Preço: {currency or 'R$'} {price}"
             )
 
-            if len(texto_cause) > 1200:
-                texto_cause = texto_cause[:1200] + "..."
-
-            linhas.append(f"cause: {texto_cause}")
-
-        if not error and not message and not cause:
-            texto = json.dumps(
-                data,
-                ensure_ascii=False
+        if condition:
+            linhas.append(
+                f"Condição: {condition}"
             )
 
-            if len(texto) > 1500:
-                texto = texto[:1500] + "..."
+        if item_id:
+            linhas.append(
+                f"Item ID: {item_id}"
+            )
+            linhas.append(
+                f"Link: https://produto.mercadolivre.com.br/{item_id}"
+            )
 
-            linhas.append(f"resposta: {texto}")
+        seller = buy_box.get("seller")
+
+        if isinstance(seller, dict):
+            seller_id = seller.get("id")
+
+            if seller_id:
+                linhas.append(
+                    f"Seller ID: {seller_id}"
+                )
+
+    else:
+        linhas.append("")
+        linhas.append(
+            "ℹ️ Este retorno não trouxe buy_box_winner."
+        )
 
     return "\n".join(linhas)
 
 
 # =========================
-# TELEGRAM WEBHOOK
+# TELEGRAM
 # =========================
 
 @app.route("/webhook", methods=["POST"])
@@ -278,7 +302,6 @@ def webhook():
     if not chat_id:
         return "OK", 200
 
-    # /start
     if text.startswith("/start"):
         send_message(
             chat_id,
@@ -286,17 +309,19 @@ def webhook():
             "Comandos:\n"
             "/status\n"
             "/teste\n"
-            "/buscar produto\n\n"
+            "/buscar produto\n"
+            "/detalhe PRODUCT_ID\n\n"
             "Exemplo:\n"
-            "/buscar Mac Mini M4 16 512"
+            "/buscar Mac Mini M4 16 512\n"
+            "/detalhe MLB74895216"
         )
 
-    # /status
     elif text.startswith("/status"):
-        if meli_access_token:
-            status_ml = "✅ Mercado Livre conectado"
-        else:
-            status_ml = "🟡 Mercado Livre aguardando autorização"
+        status_ml = (
+            "✅ Mercado Livre conectado"
+            if meli_access_token
+            else "🟡 Mercado Livre aguardando autorização"
+        )
 
         send_message(
             chat_id,
@@ -306,52 +331,29 @@ def webhook():
             f"{status_ml}"
         )
 
-    # /teste
     elif text.startswith("/teste"):
-        if not meli_access_token:
+        resultado = testar_usuario_meli()
+
+        if resultado.get("ok"):
+            data = resultado.get("data", {})
+
             send_message(
                 chat_id,
-                "⚠️ Mercado Livre ainda não está autorizado."
+                "✅ TESTE DE AUTENTICAÇÃO PASSOU!\n\n"
+                f"HTTP: {resultado.get('status')}\n"
+                f"User ID: {data.get('id')}\n"
+                f"Nickname: {data.get('nickname')}\n"
+                f"Site: {data.get('site_id')}"
             )
-
         else:
             send_message(
                 chat_id,
-                "🧪 Testando Access Token no endpoint /users/me..."
+                formatar_erro(
+                    resultado.get("status"),
+                    resultado.get("data", {}),
+                )
             )
 
-            resultado = testar_usuario_meli()
-
-            status = resultado.get("status")
-            data = resultado.get("data") or {}
-
-            if resultado.get("ok"):
-                user_id = data.get("id", "—")
-                nickname = data.get("nickname", "—")
-                site_id = data.get("site_id", "—")
-
-                send_message(
-                    chat_id,
-                    "✅ TESTE DE AUTENTICAÇÃO PASSOU!\n\n"
-                    f"HTTP: {status}\n"
-                    f"User ID: {user_id}\n"
-                    f"Nickname: {nickname}\n"
-                    f"Site: {site_id}\n\n"
-                    "✅ OAuth válido\n"
-                    "✅ Access Token válido\n"
-                    "✅ API do Mercado Livre acessível"
-                )
-
-            else:
-                send_message(
-                    chat_id,
-                    formatar_erro_api(
-                        status,
-                        data
-                    )
-                )
-
-    # /buscar
     elif text.startswith("/buscar"):
         termo = text.replace(
             "/buscar",
@@ -362,74 +364,113 @@ def webhook():
         if not termo:
             send_message(
                 chat_id,
-                "🔎 Digite um produto.\n\n"
-                "Exemplo:\n"
-                "/buscar Mac Mini M4 16 512"
+                "Use:\n/buscar Mac Mini M4 16 512"
             )
+            return "OK", 200
 
-        elif not meli_access_token:
+        send_message(
+            chat_id,
+            f"🔎 Buscando:\n{termo}"
+        )
+
+        resultado = buscar_produto_meli(termo)
+
+        if not resultado.get("ok"):
             send_message(
                 chat_id,
-                "⚠️ Mercado Livre ainda não está autorizado."
+                formatar_erro(
+                    resultado.get("status"),
+                    resultado.get("data", {}),
+                )
+            )
+            return "OK", 200
+
+        results = resultado.get(
+            "data",
+            {}
+        ).get(
+            "results",
+            []
+        )
+
+        if not results:
+            send_message(
+                chat_id,
+                "Nenhum produto encontrado."
+            )
+            return "OK", 200
+
+        linhas = [
+            "✅ PRODUTOS ENCONTRADOS",
+            "",
+        ]
+
+        for i, item in enumerate(
+            results[:5],
+            start=1
+        ):
+            nome = (
+                item.get("name")
+                or item.get("title")
+                or "Produto"
+            )
+
+            product_id = item.get(
+                "id",
+                "—"
+            )
+
+            linhas.append(
+                f"{i}. {nome}\n"
+                f"ID: {product_id}\n"
+                f"/detalhe {product_id}\n"
+            )
+
+        send_message(
+            chat_id,
+            "\n".join(linhas)
+        )
+
+    elif text.startswith("/detalhe"):
+        product_id = text.replace(
+            "/detalhe",
+            "",
+            1
+        ).strip()
+
+        if not product_id:
+            send_message(
+                chat_id,
+                "Use:\n/detalhe MLB74895216"
+            )
+            return "OK", 200
+
+        send_message(
+            chat_id,
+            f"📦 Consultando detalhes de:\n{product_id}"
+        )
+
+        resultado = detalhe_produto_meli(
+            product_id
+        )
+
+        if not resultado.get("ok"):
+            send_message(
+                chat_id,
+                formatar_erro(
+                    resultado.get("status"),
+                    resultado.get("data", {}),
+                )
             )
 
         else:
             send_message(
                 chat_id,
-                f"🔎 Testando busca para:\n{termo}"
-            )
-
-            resultado = buscar_produto_meli(termo)
-
-            status = resultado.get("status")
-            data = resultado.get("data") or {}
-
-            if not resultado.get("ok"):
-                send_message(
-                    chat_id,
-                    formatar_erro_api(
-                        status,
-                        data
-                    )
+                formatar_detalhe(
+                    product_id,
+                    resultado.get("data", {}),
                 )
-
-            else:
-                results = data.get("results", [])
-
-                if not results:
-                    send_message(
-                        chat_id,
-                        "✅ API respondeu HTTP 200.\n\n"
-                        "Nenhum produto foi retornado."
-                    )
-
-                else:
-                    linhas = [
-                        "✅ API respondeu HTTP 200!",
-                        "",
-                    ]
-
-                    for i, item in enumerate(
-                        results[:5],
-                        start=1
-                    ):
-                        nome = (
-                            item.get("name")
-                            or item.get("title")
-                            or "Produto"
-                        )
-
-                        product_id = item.get("id", "—")
-
-                        linhas.append(
-                            f"{i}. {nome}\n"
-                            f"ID: {product_id}\n"
-                        )
-
-                    send_message(
-                        chat_id,
-                        "\n".join(linhas)
-                    )
+            )
 
     return "OK", 200
 
