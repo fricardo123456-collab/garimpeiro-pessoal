@@ -7,9 +7,12 @@ Objetivos desta versão:
 - enriquecer os cinco resultados com link, parcelamento, frete e reputação quando
   esses dados forem realmente retornados pela API;
 - entregar uma única mensagem compacta e editável no Telegram;
+- aceitar buscas genéricas, aliases de comando e texto livre em conversa privada;
+- manter monitores, histórico real de preços e alertas antifalso-positivo;
 - manter OAuth, webhook e chamadas HTTP mais resilientes e seguros.
 
-O arquivo usa apenas Flask e requests como dependências externas.
+Flask e requests são obrigatórios. psycopg é opcional e usado quando DATABASE_URL
+aponta para PostgreSQL, recomendado para persistência no Render.
 """
 
 from __future__ import annotations
@@ -24,9 +27,13 @@ import logging
 import os
 import re
 import secrets
+import sqlite3
+import statistics
+import sys
 import threading
 import time
 import unicodedata
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -123,6 +130,23 @@ TOKEN_FILE = Path(
 )
 ITEM_CACHE_TTL = env_int("ITEM_CACHE_TTL", 180, 0, 3600)
 SELLER_CACHE_TTL = env_int("SELLER_CACHE_TTL", 1800, 0, 86400)
+
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+MONITOR_DB_PATH = Path(
+    os.environ.get("MONITOR_DB_PATH", "/tmp/garimpeiro_monitor.db")
+)
+CRON_SECRET = os.environ.get("CRON_SECRET", "").strip()
+MONITOR_HISTORY_DAYS = env_int("MONITOR_HISTORY_DAYS", 30, 1, 365)
+MONITOR_MIN_HISTORY_CHECKS = env_int("MONITOR_MIN_HISTORY_CHECKS", 6, 2, 100)
+MONITOR_CANDIDATES_LIMIT = env_int("MONITOR_CANDIDATES_LIMIT", 15, 5, 50)
+ALERT_CONFIRMATIONS = env_int("ALERT_CONFIRMATIONS", 2, 1, 5)
+ALERT_DROP_PERCENT = env_float("ALERT_DROP_PERCENT", 8.0, 1.0, 50.0)
+ALERT_MIN_DROP_REAIS = env_float("ALERT_MIN_DROP_REAIS", 200.0, 0.0, 10000.0)
+ALERT_RENOTIFY_DROP_PERCENT = env_float(
+    "ALERT_RENOTIFY_DROP_PERCENT", 3.0, 0.5, 25.0
+)
+ALERT_COOLDOWN_HOURS = env_int("ALERT_COOLDOWN_HOURS", 24, 1, 720)
+MONITOR_MAX_PER_CHAT = env_int("MONITOR_MAX_PER_CHAT", 20, 1, 100)
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}" if TELEGRAM_TOKEN else ""
 
@@ -316,7 +340,356 @@ def primeiro_texto(*valores: Any) -> str:
 
 
 # =============================================================================
-# TOKENS OAUTH — memória + arquivo opcional para sobreviver a reinícios locais
+# PERSISTÊNCIA — PostgreSQL quando DATABASE_URL existir; SQLite como fallback
+# =============================================================================
+
+
+class PersistentStore:
+    MONITOR_COLUMNS = (
+        "id", "chat_id", "thread_id", "query", "target_price_cents", "active", "created_at",
+        "updated_at", "last_checked_at", "pending_item_id", "pending_price_cents",
+        "pending_count", "last_alert_item_id", "last_alert_price_cents",
+        "last_alert_at",
+    )
+
+    def __init__(self) -> None:
+        self.is_postgres = bool(DATABASE_URL)
+        self.available = False
+        self.durable = False
+        self._lock = threading.RLock()
+        self._psycopg = None
+        try:
+            if self.is_postgres:
+                import psycopg  # type: ignore
+
+                self._psycopg = psycopg
+                self.durable = True
+            else:
+                MONITOR_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+                caminho = str(MONITOR_DB_PATH.resolve())
+                self.durable = not caminho.startswith("/tmp/")
+            self._init_schema()
+            self.available = True
+        except Exception as exc:
+            logger.error("Persistência indisponível: %s", exc)
+
+    def _connect(self):
+        if self.is_postgres:
+            if self._psycopg is None:
+                raise RuntimeError("Instale psycopg[binary] para usar DATABASE_URL")
+            return self._psycopg.connect(DATABASE_URL)
+        connection = sqlite3.connect(str(MONITOR_DB_PATH), timeout=30)
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA foreign_keys=ON")
+        return connection
+
+    def _sql(self, comando: str) -> str:
+        return comando.replace("?", "%s") if self.is_postgres else comando
+
+    def _init_schema(self) -> None:
+        comandos = [
+            """
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at BIGINT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS monitors (
+                id TEXT PRIMARY KEY,
+                chat_id BIGINT NOT NULL,
+                thread_id BIGINT,
+                query TEXT NOT NULL,
+                target_price_cents BIGINT,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at BIGINT NOT NULL,
+                updated_at BIGINT NOT NULL,
+                last_checked_at BIGINT,
+                pending_item_id TEXT,
+                pending_price_cents BIGINT,
+                pending_count INTEGER NOT NULL DEFAULT 0,
+                last_alert_item_id TEXT,
+                last_alert_price_cents BIGINT,
+                last_alert_at BIGINT
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS price_history (
+                id TEXT PRIMARY KEY,
+                monitor_id TEXT NOT NULL,
+                checked_at BIGINT NOT NULL,
+                item_id TEXT NOT NULL,
+                seller_id TEXT,
+                price_cents BIGINT NOT NULL,
+                reputation_level TEXT,
+                eligible INTEGER NOT NULL DEFAULT 0,
+                title TEXT,
+                link TEXT
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_history_monitor_time ON price_history (monitor_id, checked_at)",
+            "CREATE INDEX IF NOT EXISTS idx_monitors_chat_active ON monitors (chat_id, active)",
+        ]
+        with self._lock:
+            connection = self._connect()
+            try:
+                cursor = connection.cursor()
+                for comando in comandos:
+                    cursor.execute(comando)
+                connection.commit()
+            finally:
+                connection.close()
+
+    def execute(self, comando: str, params: tuple[Any, ...] = ()) -> bool:
+        if not self.available:
+            return False
+        with self._lock:
+            connection = self._connect()
+            try:
+                connection.cursor().execute(self._sql(comando), params)
+                connection.commit()
+                return True
+            except Exception:
+                connection.rollback()
+                logger.exception("Falha ao gravar persistência")
+                return False
+            finally:
+                connection.close()
+
+    def fetchone(self, comando: str, params: tuple[Any, ...] = ()) -> Optional[tuple[Any, ...]]:
+        if not self.available:
+            return None
+        with self._lock:
+            connection = self._connect()
+            try:
+                cursor = connection.cursor()
+                cursor.execute(self._sql(comando), params)
+                row = cursor.fetchone()
+                return tuple(row) if row is not None else None
+            except Exception:
+                logger.exception("Falha ao ler persistência")
+                return None
+            finally:
+                connection.close()
+
+    def fetchall(self, comando: str, params: tuple[Any, ...] = ()) -> list[tuple[Any, ...]]:
+        if not self.available:
+            return []
+        with self._lock:
+            connection = self._connect()
+            try:
+                cursor = connection.cursor()
+                cursor.execute(self._sql(comando), params)
+                return [tuple(row) for row in cursor.fetchall()]
+            except Exception:
+                logger.exception("Falha ao ler persistência")
+                return []
+            finally:
+                connection.close()
+
+    def get_setting(self, key: str) -> Optional[str]:
+        row = self.fetchone("SELECT value FROM app_settings WHERE key = ?", (key,))
+        return str(row[0]) if row and row[0] is not None else None
+
+    def set_settings(self, valores: dict[str, Any]) -> bool:
+        if not self.available:
+            return False
+        agora = int(time.time())
+        with self._lock:
+            connection = self._connect()
+            try:
+                cursor = connection.cursor()
+                for key, value in valores.items():
+                    if value is None:
+                        continue
+                    cursor.execute(
+                        self._sql(
+                            """
+                            INSERT INTO app_settings (key, value, updated_at)
+                            VALUES (?, ?, ?)
+                            ON CONFLICT (key) DO UPDATE
+                            SET value = excluded.value, updated_at = excluded.updated_at
+                            """
+                        ),
+                        (key, str(value), agora),
+                    )
+                connection.commit()
+                return True
+            except Exception:
+                connection.rollback()
+                logger.exception("Falha ao persistir configurações")
+                return False
+            finally:
+                connection.close()
+
+    def _monitor_dict(self, row: Optional[tuple[Any, ...]]) -> Optional[dict[str, Any]]:
+        if not row:
+            return None
+        return dict(zip(self.MONITOR_COLUMNS, row))
+
+    def create_monitor(
+        self,
+        chat_id: int,
+        thread_id: Optional[int],
+        query: str,
+        target_price_cents: Optional[int],
+    ) -> tuple[Optional[dict[str, Any]], str]:
+        if not self.available:
+            return None, "storage_unavailable"
+        for existente in self.list_monitors(chat_id=chat_id, active_only=True):
+            if (
+                normalizar_texto(existente.get("query")) == normalizar_texto(query)
+                and existente.get("target_price_cents") == target_price_cents
+                and existente.get("thread_id") == thread_id
+            ):
+                return existente, "duplicate"
+        count = self.fetchone(
+            "SELECT COUNT(*) FROM monitors WHERE chat_id = ? AND active = 1",
+            (chat_id,),
+        )
+        if count and int(count[0]) >= MONITOR_MAX_PER_CHAT:
+            return None, "limit"
+        monitor_id = uuid.uuid4().hex[:10]
+        agora = int(time.time())
+        ok = self.execute(
+            """
+            INSERT INTO monitors (
+                id, chat_id, thread_id, query, target_price_cents, active, created_at,
+                updated_at, pending_count
+            ) VALUES (?, ?, ?, ?, ?, 1, ?, ?, 0)
+            """,
+            (
+                monitor_id,
+                chat_id,
+                thread_id,
+                query,
+                target_price_cents,
+                agora,
+                agora,
+            ),
+        )
+        return (self.get_monitor(monitor_id, chat_id), "") if ok else (None, "write_error")
+
+    def get_monitor(self, monitor_id: str, chat_id: Optional[int] = None) -> Optional[dict[str, Any]]:
+        campos = ", ".join(self.MONITOR_COLUMNS)
+        if chat_id is None:
+            row = self.fetchone(f"SELECT {campos} FROM monitors WHERE id = ?", (monitor_id,))
+        else:
+            row = self.fetchone(
+                f"SELECT {campos} FROM monitors WHERE id = ? AND chat_id = ?",
+                (monitor_id, chat_id),
+            )
+        return self._monitor_dict(row)
+
+    def list_monitors(
+        self, chat_id: Optional[int] = None, active_only: bool = True
+    ) -> list[dict[str, Any]]:
+        campos = ", ".join(self.MONITOR_COLUMNS)
+        filtros: list[str] = []
+        params: list[Any] = []
+        if chat_id is not None:
+            filtros.append("chat_id = ?")
+            params.append(chat_id)
+        if active_only:
+            filtros.append("active = 1")
+        where = f" WHERE {' AND '.join(filtros)}" if filtros else ""
+        rows = self.fetchall(
+            f"SELECT {campos} FROM monitors{where} ORDER BY created_at ASC",
+            tuple(params),
+        )
+        return [dict(zip(self.MONITOR_COLUMNS, row)) for row in rows]
+
+    def deactivate_monitor(self, monitor_id: str, chat_id: int) -> bool:
+        monitor = self.get_monitor(monitor_id, chat_id)
+        if not monitor:
+            return False
+        return self.execute(
+            "UPDATE monitors SET active = 0, updated_at = ? WHERE id = ? AND chat_id = ?",
+            (int(time.time()), monitor_id, chat_id),
+        )
+
+    def record_history(self, monitor_id: str, checked_at: int, offer: Any, eligible: bool) -> None:
+        price_cents = int((offer.price * 100).quantize(Decimal("1")))
+        reputation = primeiro_texto(
+            obter_dict(offer.seller, "seller_reputation").get("level_id")
+        )
+        self.execute(
+            """
+            INSERT INTO price_history (
+                id, monitor_id, checked_at, item_id, seller_id, price_cents,
+                reputation_level, eligible, title, link
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                uuid.uuid4().hex,
+                monitor_id,
+                checked_at,
+                offer.item_id,
+                offer.seller_id,
+                price_cents,
+                reputation,
+                1 if eligible else 0,
+                offer.title,
+                offer.link,
+            ),
+        )
+
+    def history_baseline(self, monitor_id: str, before: int) -> tuple[Optional[int], int]:
+        desde = before - MONITOR_HISTORY_DAYS * 86400
+        rows = self.fetchall(
+            """
+            SELECT checked_at, price_cents FROM price_history
+            WHERE monitor_id = ? AND eligible = 1 AND checked_at >= ? AND checked_at < ?
+            ORDER BY checked_at ASC
+            """,
+            (monitor_id, desde, before),
+        )
+        por_check: dict[int, int] = {}
+        for checked_at, cents in rows:
+            instante, preco = int(checked_at), int(cents)
+            por_check[instante] = min(preco, por_check.get(instante, preco))
+        if not por_check:
+            return None, 0
+        median = int(statistics.median(por_check.values()))
+        return median, len(por_check)
+
+    def update_pending(
+        self,
+        monitor_id: str,
+        item_id: Optional[str],
+        price_cents: Optional[int],
+        count: int,
+        checked_at: int,
+    ) -> None:
+        self.execute(
+            """
+            UPDATE monitors SET pending_item_id = ?, pending_price_cents = ?,
+                pending_count = ?, last_checked_at = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (item_id, price_cents, count, checked_at, checked_at, monitor_id),
+        )
+
+    def mark_alert(self, monitor_id: str, item_id: str, price_cents: int, sent_at: int) -> None:
+        self.execute(
+            """
+            UPDATE monitors SET last_alert_item_id = ?, last_alert_price_cents = ?,
+                last_alert_at = ?, updated_at = ? WHERE id = ?
+            """,
+            (item_id, price_cents, sent_at, sent_at, monitor_id),
+        )
+
+    def cleanup_history(self) -> None:
+        limite = int(time.time()) - max(45, MONITOR_HISTORY_DAYS + 7) * 86400
+        self.execute("DELETE FROM price_history WHERE checked_at < ?", (limite,))
+
+
+STORE = PersistentStore()
+
+
+# =============================================================================
+# TOKENS OAUTH — memória + banco persistente + arquivo local de fallback
 # =============================================================================
 
 
@@ -327,7 +700,24 @@ class TokenStore:
         self._access = os.environ.get("MELI_ACCESS_TOKEN", "").strip() or None
         self._refresh = os.environ.get("MELI_REFRESH_TOKEN", "").strip() or None
         self._expires_at: Optional[float] = None
+        self._carregar_persistencia()
         self._carregar_arquivo()
+
+    def _carregar_persistencia(self) -> None:
+        if not STORE.available:
+            return
+        access = STORE.get_setting("meli_access_token")
+        refresh = STORE.get_setting("meli_refresh_token")
+        expires = STORE.get_setting("meli_expires_at")
+        if access:
+            self._access = access
+        if refresh:
+            self._refresh = refresh
+        if expires:
+            try:
+                self._expires_at = float(expires)
+            except ValueError:
+                pass
 
     def _carregar_arquivo(self) -> None:
         try:
@@ -338,12 +728,19 @@ class TokenStore:
                 self._access = str(data["access_token"])
             if not self._refresh and data.get("refresh_token"):
                 self._refresh = str(data["refresh_token"])
-            if data.get("expires_at"):
+            if self._expires_at is None and data.get("expires_at"):
                 self._expires_at = float(data["expires_at"])
         except Exception as exc:
             logger.warning("Não foi possível carregar o arquivo local de tokens: %s", exc)
 
     def _persistir(self) -> None:
+        STORE.set_settings(
+            {
+                "meli_access_token": self._access,
+                "meli_refresh_token": self._refresh,
+                "meli_expires_at": self._expires_at,
+            }
+        )
         try:
             self.arquivo.parent.mkdir(parents=True, exist_ok=True)
             temporario = self.arquivo.with_suffix(self.arquivo.suffix + ".tmp")
@@ -390,6 +787,23 @@ class TokenStore:
 
     def renovar(self, token_que_falhou: Optional[str] = None) -> bool:
         with self._lock:
+            # O web service e o cron podem estar em processos distintos. Antes de
+            # usar um refresh token possivelmente antigo, reaproveita o token mais
+            # recente que o outro processo já gravou no banco compartilhado.
+            if STORE.available:
+                access_persistido = STORE.get_setting("meli_access_token")
+                refresh_persistido = STORE.get_setting("meli_refresh_token")
+                if (
+                    token_que_falhou
+                    and access_persistido
+                    and access_persistido != token_que_falhou
+                ):
+                    self._access = access_persistido
+                    if refresh_persistido:
+                        self._refresh = refresh_persistido
+                    return True
+                if refresh_persistido:
+                    self._refresh = refresh_persistido
             if token_que_falhou and self._access and self._access != token_que_falhou:
                 return True
             if not self._refresh or not MELI_CLIENT_ID or not MELI_CLIENT_SECRET:
@@ -492,6 +906,23 @@ def pesquisar_catalogo(termo: str) -> ApiResult:
             "status": "active",
             "q": termo,
             "limit": MAX_CATALOG_RESULTS,
+        },
+    )
+
+
+def pesquisar_anuncios_diretos(termo: str) -> ApiResult:
+    """Busca anúncios comuns quando o produto não existe no catálogo central.
+
+    Alguns itens (principalmente acessórios, usados e produtos de nicho) não
+    aparecem em ``/products/search``. A busca pública do site funciona como rota
+    alternativa; se a aplicação do Mercado Livre não tiver permissão para esse
+    endpoint, o erro é tratado sem derrubar a rota de catálogo.
+    """
+    return meli_get(
+        f"/sites/{SITE_ID}/search",
+        params={
+            "q": termo,
+            "limit": min(50, MAX_OFFERS_TO_ENRICH),
         },
     )
 
@@ -615,6 +1046,19 @@ MARKETING_WORDS = {
     "lacrado", "lacre", "pronta", "entrega", "envio", "imediato", "imperdivel",
 }
 
+OPTIONAL_QUERY_TERMS = {
+    "conexao", "conectividade", "bluetooth", "wireless", "fio", "compativel",
+    "compatibilidade", "versao", "modelo",
+}
+
+PRODUCT_TYPE_TERMS = {
+    "teclado", "mouse", "monitor", "notebook", "laptop", "computador", "desktop",
+    "headset", "fone", "smartphone", "celular", "tablet", "televisao", "tv",
+    "camera", "impressora", "roteador", "controle", "cadeira", "aspirador",
+    "cafeteira", "geladeira", "fogao", "microondas", "ar condicionado", "console",
+    "videogame", "ssd", "memoria", "carregador", "caixa de som", "soundbar",
+}
+
 ACCESSORY_TERMS = {
     "suporte", "base para", "stand para", "hub usb", "dock", "docking station",
     "case", "capa", "sleeve", "bolsa", "mochila", "pelicula", "skin", "adesivo",
@@ -656,6 +1100,8 @@ class SearchSpec:
     family_key: str = ""
     family_label: str = ""
     identity_terms: list[str] = field(default_factory=list)
+    model_terms: list[str] = field(default_factory=list)
+    product_terms: list[str] = field(default_factory=list)
     chip: Optional[str] = None
     chip_tier: Optional[str] = None
     ram_gb: Optional[int] = None
@@ -688,6 +1134,14 @@ def formatar_capacidade(gb: int) -> str:
     if gb >= 1024 and gb % 1024 == 0:
         return f"{gb // 1024} TB"
     return f"{gb} GB"
+
+
+def parece_codigo_modelo(token: str) -> bool:
+    return bool(
+        len(token) >= 3
+        and re.search(r"[a-z]", token)
+        and re.search(r"\d", token)
+    )
 
 
 def capacidade_para_gb(numero: str, unidade: str) -> Optional[int]:
@@ -828,7 +1282,12 @@ def parse_search_spec(termo: str) -> SearchSpec:
     identity_terms: list[str] = []
     for token in norm.split():
         token_limpo = token.strip(".,\"")
-        if not token_limpo or token_limpo in STOPWORDS or token_limpo in MARKETING_WORDS:
+        if (
+            not token_limpo
+            or token_limpo in STOPWORDS
+            or token_limpo in MARKETING_WORDS
+            or token_limpo in OPTIONAL_QUERY_TERMS
+        ):
             continue
         if token_limpo == chip:
             continue
@@ -838,8 +1297,21 @@ def parse_search_spec(termo: str) -> SearchSpec:
             continue
         if re.fullmatch(r"(110|127|220)v?", token_limpo):
             continue
-        if len(token_limpo) >= 2:
+        # Números isolados também podem ser a geração do produto (PlayStation 5,
+        # JBL Flip 6 etc.). Capacidades, tela e voltagem já foram identificadas
+        # acima e continuam tratadas pelos validadores específicos.
+        if len(token_limpo) >= 2 or (profile == "generic" and token_limpo.isdigit()):
             identity_terms.append(token_limpo)
+
+    identity_terms = lista_unica(identity_terms)
+    model_terms = [
+        token
+        for token in identity_terms
+        if parece_codigo_modelo(token) or (profile == "generic" and token.isdigit())
+    ]
+    product_terms = [
+        termo for termo in PRODUCT_TYPE_TERMS if contem_termo(norm, termo)
+    ]
 
     return SearchSpec(
         raw=raw,
@@ -847,7 +1319,9 @@ def parse_search_spec(termo: str) -> SearchSpec:
         profile=profile,
         family_key=family_key,
         family_label=family_label,
-        identity_terms=lista_unica(identity_terms),
+        identity_terms=identity_terms,
+        model_terms=model_terms,
+        product_terms=sorted(product_terms),
         chip=chip,
         chip_tier=chip_tier,
         ram_gb=ram,
@@ -1144,12 +1618,54 @@ def avaliar_compatibilidade(
         faltantes_identidade = [
             t for t in identity_to_check if not contem_termo(evidencia.normalized_text, t)
         ]
-        encontrados = len(identity_to_check) - len(faltantes_identidade)
-        proporcao = encontrados / len(identity_to_check)
-        if proporcao < 0.65:
-            conflitos.append("produto diferente")
-        elif proporcao < 1:
-            confidence -= 10
+        if family_tokens:
+            encontrados = len(identity_to_check) - len(faltantes_identidade)
+            proporcao = encontrados / len(identity_to_check)
+            if proporcao < 0.65:
+                conflitos.append("produto diferente")
+            elif proporcao < 1:
+                confidence -= 10
+        else:
+            faltantes_modelo = [
+                termo for termo in spec.model_terms if termo in faltantes_identidade
+            ]
+            faltantes_produto = [
+                termo
+                for termo in spec.product_terms
+                if not contem_termo(evidencia.normalized_text, termo)
+            ]
+            if faltantes_modelo:
+                conflitos.append(
+                    "modelo diferente (faltou " + ", ".join(faltantes_modelo) + ")"
+                )
+            if faltantes_produto:
+                conflitos.append(
+                    "tipo de produto diferente (faltou "
+                    + ", ".join(faltantes_produto)
+                    + ")"
+                )
+
+            def peso_identidade(termo: str) -> int:
+                if termo in spec.model_terms:
+                    return 5
+                if termo in spec.product_terms or len(termo) >= 7:
+                    return 2
+                return 1
+
+            peso_total = sum(peso_identidade(t) for t in identity_to_check)
+            peso_encontrado = sum(
+                peso_identidade(t)
+                for t in identity_to_check
+                if t not in faltantes_identidade
+            )
+            similaridade = peso_encontrado / max(1, peso_total)
+            if similaridade < 0.45:
+                conflitos.append("produto pouco aderente à busca")
+            elif similaridade < 0.75:
+                confidence -= 15
+            elif similaridade < 1:
+                confidence -= 5
+
         if family_tokens and faltantes_identidade:
             ausentes.extend(f"modelo:{t}" for t in faltantes_identidade)
 
@@ -1407,6 +1923,19 @@ def extrair_garantia(raw: dict[str, Any], detail: dict[str, Any]) -> str:
 
 
 def extrair_local(raw: dict[str, Any], detail: dict[str, Any]) -> tuple[str, str]:
+    ufs = {
+        "acre": "AC", "alagoas": "AL", "amapa": "AP", "amazonas": "AM",
+        "bahia": "BA", "ceara": "CE", "distrito federal": "DF",
+        "espirito santo": "ES", "goias": "GO", "maranhao": "MA",
+        "mato grosso": "MT", "mato grosso do sul": "MS", "minas gerais": "MG",
+        "para": "PA", "paraiba": "PB", "parana": "PR", "pernambuco": "PE",
+        "piaui": "PI", "rio de janeiro": "RJ", "rio grande do norte": "RN",
+        "rio grande do sul": "RS", "rondonia": "RO", "roraima": "RR",
+        "santa catarina": "SC", "sao paulo": "SP", "sergipe": "SE",
+        "tocantins": "TO",
+    }
+    cidade_final = ""
+    estado_final = ""
     for fonte in (detail, raw):
         endereco = fonte.get("seller_address")
         if not isinstance(endereco, dict):
@@ -1414,15 +1943,22 @@ def extrair_local(raw: dict[str, Any], detail: dict[str, Any]) -> tuple[str, str
         city = endereco.get("city")
         state = endereco.get("state")
         cidade = primeiro_texto(city.get("name") if isinstance(city, dict) else city)
-        estado = primeiro_texto(
-            state.get("id") if isinstance(state, dict) else "",
-            state.get("name") if isinstance(state, dict) else state,
+        estado_nome = primeiro_texto(
+            state.get("name") if isinstance(state, dict) else state
         )
-        if estado.startswith("BR-"):
-            estado = estado[3:]
-        if cidade or estado:
-            return cidade, estado
-    return "", ""
+        estado_id = primeiro_texto(state.get("id") if isinstance(state, dict) else "")
+        estado = ufs.get(normalizar_texto(estado_nome), estado_nome)
+        if not estado and estado_id.startswith("BR-"):
+            estado = estado_id[3:]
+        if estado.startswith("TUx") or not re.fullmatch(r"[A-Za-zÀ-ÿ -]{2,40}|[A-Z]{2}", estado):
+            estado = ""
+        if cidade and not cidade.startswith("TUx") and not cidade_final:
+            cidade_final = cidade
+        if estado and not estado_final:
+            estado_final = estado
+        if cidade_final and estado_final:
+            break
+    return cidade_final, estado_final
 
 
 def link_item(item_id: str, detail: dict[str, Any], raw: dict[str, Any]) -> str:
@@ -1572,21 +2108,31 @@ def chave_ranking(oferta: Offer) -> tuple[Any, ...]:
     return (frete_desconhecido, valor, ordem_level, -oferta.confidence, oferta.item_id)
 
 
-def buscar_ofertas_completas(termo: str) -> SearchResult:
+def buscar_ofertas_completas(
+    termo: str, limite_resultados: int = MAX_RESULTS
+) -> SearchResult:
+    limite_resultados = max(1, min(int(limite_resultados), MAX_OFFERS_TO_ENRICH))
     spec = parse_search_spec(termo)
     stats = SearchStats()
     resultado_catalogo = pesquisar_catalogo(spec.raw)
-    if not resultado_catalogo.ok:
-        return SearchResult(
-            False,
-            resultado_catalogo.status,
-            spec,
-            [],
-            stats,
-            resultado_catalogo.error,
-        )
+    resultado_direto: Optional[ApiResult] = None
+    if resultado_catalogo.ok:
+        produtos = extrair_lista_resposta(resultado_catalogo.data)
+    else:
+        # Nem toda busca possui um produto de catálogo. Nessa situação, tenta os
+        # anúncios comuns antes de declarar falha da API.
+        resultado_direto = pesquisar_anuncios_diretos(spec.raw)
+        if not resultado_direto.ok:
+            return SearchResult(
+                False,
+                resultado_catalogo.status or resultado_direto.status,
+                spec,
+                [],
+                stats,
+                resultado_catalogo.error or resultado_direto.error,
+            )
+        produtos = []
 
-    produtos = extrair_lista_resposta(resultado_catalogo.data)
     stats.products_received = len(produtos)
     ranqueados: list[tuple[int, dict[str, Any]]] = []
     for produto in produtos:
@@ -1616,6 +2162,37 @@ def buscar_ofertas_completas(termo: str) -> SearchResult:
                 preco_antigo = decimal_seguro(atual[0].get("price")) or Decimal("999999999")
                 if preco_novo < preco_antigo:
                     por_item[item_id] = (raw, produto)
+
+    # Se o catálogo não trouxe anúncios, procura diretamente no marketplace.
+    # O restante do pipeline é o mesmo: detalhes, compatibilidade estrita,
+    # deduplicação, vendedor, risco e ordenação por preço real.
+    if not por_item:
+        if resultado_direto is None:
+            resultado_direto = pesquisar_anuncios_diretos(spec.raw)
+        if resultado_direto.ok:
+            anuncios = extrair_lista_resposta(resultado_direto.data)
+            stats.products_received += len(anuncios)
+            for raw in anuncios:
+                stats.raw_offers += 1
+                item_id = primeiro_texto(raw.get("item_id"), raw.get("id"))
+                if not item_id:
+                    continue
+                pseudo_produto = {
+                    "id": primeiro_texto(
+                        raw.get("catalog_product_id"), raw.get("product_id")
+                    ),
+                    "name": primeiro_texto(raw.get("title"), raw.get("name")),
+                }
+                atual = por_item.get(item_id)
+                if atual is None:
+                    por_item[item_id] = (raw, pseudo_produto)
+                    continue
+                preco_novo = decimal_seguro(raw.get("price")) or Decimal("999999999")
+                preco_antigo = decimal_seguro(atual[0].get("price")) or Decimal(
+                    "999999999"
+                )
+                if preco_novo < preco_antigo:
+                    por_item[item_id] = (raw, pseudo_produto)
 
     # Limita o enriquecimento sem voltar a ordenar por catálogo: a pré-seleção usa o
     # menor preço bruto; a ordenação final só acontece após validar configuração.
@@ -1653,13 +2230,13 @@ def buscar_ofertas_completas(termo: str) -> SearchResult:
 
     # Reputação é enriquecida antes do desempate, mas preço continua sendo a chave 1.
     sellers: dict[str, dict[str, Any]] = {}
-    for oferta in ofertas[: max(MAX_RESULTS, SHIPPING_ENRICH_LIMIT)]:
+    for oferta in ofertas[: max(limite_resultados, SHIPPING_ENRICH_LIMIT)]:
         if oferta.seller_id and oferta.seller_id not in sellers:
             sellers[oferta.seller_id] = obter_vendedor(oferta.seller_id)
         oferta.seller = sellers.get(oferta.seller_id, {})
 
     ofertas.sort(key=chave_ranking)
-    return SearchResult(True, 200, spec, ofertas[:MAX_RESULTS], stats)
+    return SearchResult(True, 200, spec, ofertas[:limite_resultados], stats)
 
 
 # =============================================================================
@@ -1680,6 +2257,29 @@ POWER_SELLER_LABELS = {
     "gold": "MercadoLíder Gold",
     "platinum": "MercadoLíder Platinum",
 }
+
+SAFE_REPUTATION_LEVELS = {"5_green", "4_light_green"}
+
+
+def reputation_level(oferta: Offer) -> str:
+    return primeiro_texto(
+        obter_dict(oferta.seller, "seller_reputation").get("level_id")
+    )
+
+
+def garantia_insegura(garantia: str) -> bool:
+    norm = normalizar_texto(garantia)
+    return bool(norm and ("sem garantia" in norm or "no warranty" in norm))
+
+
+def oferta_elegivel_alerta(oferta: Offer) -> bool:
+    return bool(
+        oferta.item_id
+        and oferta.link
+        and oferta.condition == "new"
+        and reputation_level(oferta) in SAFE_REPUTATION_LEVELS
+        and not garantia_insegura(oferta.warranty)
+    )
 
 
 def formatar_vendedor(oferta: Offer) -> str:
@@ -1716,7 +2316,10 @@ def formatar_frete_garantia(oferta: Offer) -> str:
     if oferta.delivery_text:
         partes.append(f"entrega {oferta.delivery_text}")
     if oferta.warranty:
-        partes.append(f"🛡 {oferta.warranty}")
+        icone = "⚠️" if garantia_insegura(oferta.warranty) else "🛡"
+        partes.append(f"{icone} {oferta.warranty}")
+    else:
+        partes.append("⚠️ garantia não informada")
     return " • ".join(partes)
 
 
@@ -1748,6 +2351,18 @@ def montar_card(oferta: Offer, posicao: int) -> str:
     if local:
         linha_vendedor = f"📍 {local} • {linha_vendedor}"
     linhas.append(html.escape(linha_vendedor))
+
+    level = reputation_level(oferta)
+    if level in {"1_red", "2_orange"}:
+        linhas.append("⚠️ <b>Alto risco — não elegível para alerta automático</b>")
+    elif level == "3_yellow":
+        linhas.append("⚠️ Reputação intermediária — alerta automático bloqueado")
+    elif not level:
+        linhas.append("⚠️ Reputação não confirmada — alerta automático bloqueado")
+    elif garantia_insegura(oferta.warranty):
+        linhas.append("⚠️ Sem garantia declarada — alerta automático bloqueado")
+    elif oferta.condition != "new":
+        linhas.append("⚠️ Item não novo — alerta automático bloqueado")
 
     if oferta.deal_ids:
         linhas.append("🏷 Promoção detectada no anúncio")
@@ -1787,16 +2402,27 @@ def mensagem_sem_resultados(resultado: SearchResult) -> str:
     spec = resultado.spec
     configuracao = spec.configuration_label(spec.raw)
     stats = resultado.stats
+    possui_configuracao = any(
+        valor is not None
+        for valor in (spec.chip, spec.ram_gb, spec.storage_gb, spec.voltage, spec.screen_inches)
+    )
     linhas = [
         "❌ <b>Nenhuma oferta totalmente compatível</b>",
         "",
         f"Busca validada: <b>{html.escape(configuracao)}</b>",
     ]
-    if STRICT_CONFIGURATION:
+    if STRICT_CONFIGURATION and possui_configuracao:
         linhas.extend(
             [
                 "",
                 "Anúncios sem confirmação explícita da configuração foram excluídos.",
+            ]
+        )
+    elif not possui_configuracao:
+        linhas.extend(
+            [
+                "",
+                "Resultados com modelo ou tipo de produto diferente foram excluídos.",
             ]
         )
     if stats.unique_items:
@@ -1808,13 +2434,22 @@ def mensagem_sem_resultados(resultado: SearchResult) -> str:
                 f"Configuração não confirmada: {stats.rejected_unconfirmed}",
             ]
         )
-    linhas.extend(
-        [
-            "",
-            "Tente escrever capacidades com unidade, por exemplo:",
-            "<code>/buscar Mac Mini M4 16 GB RAM 512 GB SSD</code>",
-        ]
-    )
+    if possui_configuracao:
+        linhas.extend(
+            [
+                "",
+                "Tente escrever capacidades com unidade, por exemplo:",
+                "<code>/buscar Mac Mini M4 16 GB RAM 512 GB SSD</code>",
+            ]
+        )
+    else:
+        linhas.extend(
+            [
+                "",
+                "Tente manter marca e código exato do modelo, por exemplo:",
+                "<code>/buscar Teclado Logitech Pebble Keys 2 K380s</code>",
+            ]
+        )
     return "\n".join(linhas)
 
 
@@ -1980,6 +2615,398 @@ def agendar_busca(chat_id: int, termo: str, message_thread_id: Optional[int]) ->
 
 
 # =============================================================================
+# MONITORAMENTO AUTOMÁTICO E ALERTAS DE PREÇO
+# =============================================================================
+
+
+MONITOR_RUN_LOCK = threading.Lock()
+
+
+def decimal_para_centavos(valor: Decimal) -> int:
+    return int((valor * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+def centavos_para_decimal(valor: Any) -> Optional[Decimal]:
+    try:
+        return (Decimal(int(valor)) / 100).quantize(Decimal("0.01"))
+    except (TypeError, ValueError, InvalidOperation):
+        return None
+
+
+def parse_preco_monitor(texto: str) -> Optional[int]:
+    valor = re.sub(r"(?i)r\$", "", str(texto or "")).strip().replace(" ", "")
+    if not valor:
+        return None
+    if "," in valor:
+        valor = valor.replace(".", "").replace(",", ".")
+    elif re.fullmatch(r"\d{1,3}(?:\.\d{3})+", valor):
+        valor = valor.replace(".", "")
+    numero = decimal_seguro(valor)
+    if numero is None or numero <= 0:
+        return None
+    return decimal_para_centavos(numero)
+
+
+def parse_monitor_request(argumento: str) -> tuple[str, Optional[int], str]:
+    partes = [parte.strip() for parte in argumento.rsplit("|", 1)]
+    query = partes[0] if partes else ""
+    target: Optional[int] = None
+    if len(partes) == 2:
+        if not partes[1]:
+            return "", None, "Preço-alvo vazio."
+        target = parse_preco_monitor(partes[1])
+        if target is None:
+            return "", None, "Preço-alvo inválido."
+    return query, target, ""
+
+
+def monitor_target_text(monitor: dict[str, Any]) -> str:
+    target = centavos_para_decimal(monitor.get("target_price_cents"))
+    return brl(target) if target is not None else "detecção pelo histórico"
+
+
+def pode_realertar(monitor: dict[str, Any], item_id: str, price_cents: int, agora: int) -> bool:
+    last_price = monitor.get("last_alert_price_cents")
+    last_at = monitor.get("last_alert_at")
+    last_item = primeiro_texto(monitor.get("last_alert_item_id"))
+    if last_price is None or last_at is None:
+        return True
+    try:
+        last_price_int = int(last_price)
+        last_at_int = int(last_at)
+    except (TypeError, ValueError):
+        return True
+    queda_minima = Decimal("1") - Decimal(str(ALERT_RENOTIFY_DROP_PERCENT)) / 100
+    if Decimal(price_cents) <= Decimal(last_price_int) * queda_minima:
+        return True
+    cooldown_ok = agora - last_at_int >= ALERT_COOLDOWN_HOURS * 3600
+    return bool(item_id != last_item and cooldown_ok and price_cents < last_price_int)
+
+
+def montar_alerta_promocao(
+    monitor: dict[str, Any],
+    oferta: Offer,
+    baseline_cents: Optional[int],
+    history_checks: int,
+    motivos: list[str],
+    confirmations: int,
+) -> str:
+    linhas = [
+        "🚨 <b>PROMOÇÃO CONFIRMADA</b>",
+        "",
+        f"<b>{html.escape(brl(oferta.price))}</b>",
+        html.escape(limitar_texto(oferta.config_label, 100)),
+    ]
+    target = centavos_para_decimal(monitor.get("target_price_cents"))
+    if target is not None:
+        linhas.append(f"🎯 Preço-alvo: {html.escape(brl(target))}")
+    if baseline_cents is not None:
+        baseline = centavos_para_decimal(baseline_cents)
+        if baseline and baseline > 0:
+            queda = ((baseline - oferta.price) / baseline * 100).quantize(Decimal("0.1"))
+            linhas.append(
+                "📉 "
+                + html.escape(
+                    f"{str(queda).replace('.', ',')}% abaixo da mediana de "
+                    f"{history_checks} verificações"
+                )
+            )
+    linhas.append(f"✅ Confirmada em {confirmations} verificações consecutivas")
+    linhas.append("🟢 Vendedor elegível para alerta automático")
+    linhas.append(html.escape(formatar_frete_garantia(oferta)))
+    local = ", ".join(filter(None, [oferta.city, oferta.state]))
+    seller = formatar_vendedor(oferta)
+    linhas.append(html.escape(f"📍 {local} • 👤 {seller}" if local else f"👤 {seller}"))
+    if motivos:
+        linhas.append("🔎 " + html.escape(" e ".join(motivos)))
+    if oferta.link:
+        linhas.append(f'🔗 <a href="{html.escape(oferta.link, quote=True)}">Abrir anúncio</a>')
+    linhas.append(
+        "\n<i>O alerta usa histórico próprio e reputação; não usa o preço anterior do anúncio como prova.</i>"
+    )
+    return "\n".join(linhas)
+
+
+def processar_monitor(
+    monitor: dict[str, Any], resultado: Optional[SearchResult] = None
+) -> str:
+    monitor_id = str(monitor["id"])
+    checked_at = int(time.time())
+    if resultado is None:
+        resultado = buscar_ofertas_completas(
+            str(monitor["query"]), MONITOR_CANDIDATES_LIMIT
+        )
+    if not resultado.ok:
+        STORE.update_pending(monitor_id, None, None, 0, checked_at)
+        return "api_error"
+
+    baseline_cents, history_checks = STORE.history_baseline(monitor_id, checked_at)
+    elegiveis: list[Offer] = []
+    for oferta in resultado.offers:
+        elegivel = oferta_elegivel_alerta(oferta)
+        STORE.record_history(monitor_id, checked_at, oferta, elegivel)
+        if elegivel:
+            elegiveis.append(oferta)
+
+    if not elegiveis:
+        STORE.update_pending(monitor_id, None, None, 0, checked_at)
+        return "no_safe_offer"
+
+    elegiveis.sort(key=lambda oferta: oferta.price)
+    melhor = elegiveis[0]
+    current_cents = decimal_para_centavos(melhor.price)
+    target_cents = monitor.get("target_price_cents")
+    target_hit = target_cents is not None and current_cents <= int(target_cents)
+
+    history_hit = False
+    if baseline_cents and history_checks >= MONITOR_MIN_HISTORY_CHECKS:
+        percentual = Decimal("1") - Decimal(str(ALERT_DROP_PERCENT)) / 100
+        limite = int(Decimal(baseline_cents) * percentual)
+        queda_absoluta = baseline_cents - current_cents
+        history_hit = bool(
+            current_cents <= limite
+            and queda_absoluta >= int(ALERT_MIN_DROP_REAIS * 100)
+        )
+
+    promocao = target_hit or history_hit
+    if not promocao:
+        STORE.update_pending(monitor_id, None, None, 0, checked_at)
+        return "observed"
+
+    pending_item = primeiro_texto(monitor.get("pending_item_id"))
+    pending_price = monitor.get("pending_price_cents")
+    try:
+        pending_count = int(monitor.get("pending_count") or 0)
+        pending_price_int = int(pending_price) if pending_price is not None else None
+    except (TypeError, ValueError):
+        pending_count, pending_price_int = 0, None
+    mesma_oferta = pending_item == melhor.item_id
+    preco_confirmado = bool(
+        pending_price_int is not None
+        and current_cents <= int(Decimal(pending_price_int) * Decimal("1.01"))
+    )
+    confirmations = pending_count + 1 if mesma_oferta and preco_confirmado else 1
+    STORE.update_pending(
+        monitor_id, melhor.item_id, current_cents, confirmations, checked_at
+    )
+    if confirmations < ALERT_CONFIRMATIONS:
+        return "pending_confirmation"
+
+    monitor_atual = STORE.get_monitor(monitor_id) or monitor
+    if not pode_realertar(monitor_atual, melhor.item_id, current_cents, checked_at):
+        return "already_alerted"
+
+    motivos = []
+    if target_hit:
+        motivos.append("abaixo do preço-alvo")
+    if history_hit:
+        motivos.append("queda real no histórico")
+    texto = montar_alerta_promocao(
+        monitor_atual,
+        melhor,
+        baseline_cents,
+        history_checks,
+        motivos,
+        confirmations,
+    )
+    message_id = send_message(
+        int(monitor["chat_id"]),
+        texto,
+        message_thread_id=(
+            int(monitor["thread_id"]) if monitor.get("thread_id") is not None else None
+        ),
+    )
+    if message_id is not None:
+        STORE.mark_alert(monitor_id, melhor.item_id, current_cents, checked_at)
+        return "alert_sent"
+    return "telegram_error"
+
+
+def executar_monitores(
+    *, chat_id: Optional[int] = None, monitor_ids: Optional[set[str]] = None
+) -> dict[str, int]:
+    resumo: dict[str, int] = {"checked": 0, "alerts": 0, "errors": 0}
+    if not STORE.available:
+        resumo["errors"] = 1
+        return resumo
+    if not MONITOR_RUN_LOCK.acquire(blocking=False):
+        resumo["errors"] = 1
+        return resumo
+    try:
+        monitores = STORE.list_monitors(chat_id=chat_id, active_only=True)
+        if monitor_ids is not None:
+            monitores = [m for m in monitores if str(m["id"]) in monitor_ids]
+        resultados_cache: dict[str, SearchResult] = {}
+        for monitor in monitores:
+            try:
+                chave_busca = normalizar_texto(monitor.get("query"))
+                resultado_busca = resultados_cache.get(chave_busca)
+                if resultado_busca is None:
+                    resultado_busca = buscar_ofertas_completas(
+                        str(monitor["query"]), MONITOR_CANDIDATES_LIMIT
+                    )
+                    resultados_cache[chave_busca] = resultado_busca
+                status = processar_monitor(monitor, resultado_busca)
+                resumo["checked"] += 1
+                if status == "alert_sent":
+                    resumo["alerts"] += 1
+                elif status in {"api_error", "telegram_error"}:
+                    resumo["errors"] += 1
+            except Exception:
+                logger.exception("Falha no monitor %s", monitor.get("id"))
+                resumo["errors"] += 1
+        STORE.cleanup_history()
+        return resumo
+    finally:
+        MONITOR_RUN_LOCK.release()
+
+
+def executar_verificacao_manual(
+    chat_id: int,
+    thread_id: Optional[int],
+    monitor_ids: Optional[set[str]] = None,
+) -> None:
+    status_id = send_message(
+        chat_id,
+        "🔄 <b>VERIFICANDO MONITORES…</b>",
+        message_thread_id=thread_id,
+    )
+    resumo = executar_monitores(chat_id=chat_id, monitor_ids=monitor_ids)
+    texto = (
+        "✅ <b>VERIFICAÇÃO CONCLUÍDA</b>\n\n"
+        f"Monitores verificados: {resumo['checked']}\n"
+        f"Novos alertas: {resumo['alerts']}\n"
+        f"Erros: {resumo['errors']}"
+    )
+    editar_ou_enviar(chat_id, status_id, texto, thread_id)
+
+
+def comando_monitorar(
+    chat_id: int, thread_id: Optional[int], argumento: str
+) -> None:
+    query, target_cents, erro = parse_monitor_request(argumento)
+    if erro:
+        send_message(chat_id, f"❌ {html.escape(erro)}", message_thread_id=thread_id)
+        return
+    if not query:
+        send_message(
+            chat_id,
+            "Use:\n<code>/monitorar produto | preço-alvo</code>\n\n"
+            "Exemplo:\n<code>/monitorar Mac Mini M4 16 512 | 6300</code>",
+            message_thread_id=thread_id,
+        )
+        return
+    if len(query) > 180:
+        send_message(chat_id, "❌ A busca é longa demais.", message_thread_id=thread_id)
+        return
+    monitor, code = STORE.create_monitor(chat_id, thread_id, query, target_cents)
+    if not monitor:
+        mensagem = {
+            "limit": "Você atingiu o limite de monitores ativos.",
+            "storage_unavailable": "A persistência está indisponível.",
+        }.get(code, "Não foi possível criar o monitor.")
+        send_message(chat_id, f"❌ {mensagem}", message_thread_id=thread_id)
+        return
+
+    if code == "duplicate":
+        send_message(
+            chat_id,
+            "ℹ️ Este monitor já existe.\n\n"
+            f"ID: <code>{html.escape(str(monitor['id']))}</code>\n"
+            f"Busca: {html.escape(str(monitor['query']))}\n"
+            f"Alvo: {html.escape(monitor_target_text(monitor))}",
+            message_thread_id=thread_id,
+        )
+        return
+
+    linhas = [
+        "✅ <b>MONITOR CRIADO</b>",
+        "",
+        f"ID: <code>{html.escape(str(monitor['id']))}</code>",
+        f"Busca: {html.escape(str(monitor['query']))}",
+        f"Alvo: {html.escape(monitor_target_text(monitor))}",
+        "",
+        f"O alerta exige vendedor confiável e {ALERT_CONFIRMATIONS} verificações consecutivas.",
+    ]
+    if target_cents is None:
+        linhas.append(
+            f"O bot aprenderá o preço normal após pelo menos {MONITOR_MIN_HISTORY_CHECKS} verificações."
+        )
+    if not STORE.durable:
+        linhas.append(
+            "⚠️ O banco atual é local e pode ser perdido num reinício. Configure DATABASE_URL para persistência definitiva."
+        )
+    send_message(chat_id, "\n".join(linhas), message_thread_id=thread_id)
+    EXECUTOR.submit(
+        executar_verificacao_manual, chat_id, thread_id, {str(monitor["id"])}
+    )
+
+
+def comando_monitores(chat_id: int, thread_id: Optional[int]) -> None:
+    monitores = STORE.list_monitors(chat_id=chat_id, active_only=True)
+    if not monitores:
+        send_message(
+            chat_id,
+            "Você não possui monitores ativos.\n\n"
+            "Crie um com:\n<code>/monitorar produto | preço-alvo</code>",
+            message_thread_id=thread_id,
+        )
+        return
+    blocos = ["📡 <b>MONITORES ATIVOS</b>"]
+    for monitor in monitores:
+        blocos.append(
+            f"<b>{html.escape(str(monitor['id']))}</b> • {html.escape(monitor_target_text(monitor))}\n"
+            f"{html.escape(limitar_texto(monitor['query'], 100))}"
+        )
+    blocos.append("Use <code>/parar ID</code> para desativar um monitor.")
+    send_message(chat_id, "\n\n".join(blocos), message_thread_id=thread_id)
+
+
+def comando_parar(chat_id: int, thread_id: Optional[int], argumento: str) -> None:
+    monitor_id = argumento.strip().lower()
+    if not monitor_id:
+        send_message(chat_id, "Use: <code>/parar ID</code>", message_thread_id=thread_id)
+        return
+    if STORE.deactivate_monitor(monitor_id, chat_id):
+        send_message(
+            chat_id,
+            f"⏹ Monitor <code>{html.escape(monitor_id)}</code> desativado.",
+            message_thread_id=thread_id,
+        )
+    else:
+        send_message(chat_id, "❌ Monitor não encontrado.", message_thread_id=thread_id)
+
+
+def comando_historico(chat_id: int, thread_id: Optional[int], argumento: str) -> None:
+    monitor_id = argumento.strip().lower()
+    monitor = STORE.get_monitor(monitor_id, chat_id) if monitor_id else None
+    if not monitor:
+        send_message(
+            chat_id,
+            "Use: <code>/historico ID</code>",
+            message_thread_id=thread_id,
+        )
+        return
+    baseline_cents, checks = STORE.history_baseline(monitor_id, int(time.time()) + 1)
+    baseline = centavos_para_decimal(baseline_cents)
+    ultima = monitor.get("last_checked_at")
+    ultima_texto = (
+        time.strftime("%d/%m/%Y %H:%M", time.localtime(int(ultima)))
+        if ultima
+        else "ainda não verificado"
+    )
+    send_message(
+        chat_id,
+        "📊 <b>HISTÓRICO DO MONITOR</b>\n\n"
+        f"Busca: {html.escape(str(monitor['query']))}\n"
+        f"Mediana: {html.escape(brl(baseline)) if baseline is not None else 'aprendendo'}\n"
+        f"Verificações válidas: {checks}\n"
+        f"Última verificação: {html.escape(ultima_texto)}",
+        message_thread_id=thread_id,
+    )
+
+
+# =============================================================================
 # OAUTH E ROTAS WEB
 # =============================================================================
 
@@ -2085,13 +3112,37 @@ def home():
 @app.get("/health")
 def health():
     configurado = bool(TELEGRAM_TOKEN and MELI_CLIENT_ID and MELI_CLIENT_SECRET)
+    backend = (
+        "postgresql"
+        if STORE.is_postgres and STORE.available
+        else "sqlite"
+        if STORE.available
+        else "unavailable"
+    )
     return {
         "ok": True,
         "configured": configurado,
         "mercado_livre_connected": TOKENS.conectado(),
         "strict_configuration": STRICT_CONFIGURATION,
         "active_searches": len(ACTIVE_CHATS),
+        "monitor_storage": backend,
+        "monitor_storage_durable": STORE.durable,
+        "active_monitors": len(STORE.list_monitors(active_only=True)),
     }, 200
+
+
+@app.post("/cron/check")
+def cron_check():
+    if not CRON_SECRET:
+        return {"ok": False, "error": "cron_disabled"}, 503
+    recebido = request.headers.get("X-Cron-Secret", "")
+    authorization = request.headers.get("Authorization", "")
+    if authorization.lower().startswith("bearer "):
+        recebido = authorization[7:].strip()
+    if not hmac.compare_digest(recebido, CRON_SECRET):
+        return {"ok": False, "error": "forbidden"}, 403
+    resumo = executar_monitores()
+    return {"ok": resumo["errors"] == 0, **resumo}, 200
 
 
 @app.get("/oauth/login")
@@ -2229,16 +3280,28 @@ def separar_comando(texto: str) -> tuple[str, str]:
 def mensagem_inicial() -> str:
     return (
         "🤖 <b>GARIMPEIRO PESSOAL</b>\n\n"
-        "Encontre as cinco melhores ofertas com configuração confirmada e menor preço primeiro.\n\n"
-        "Exemplo:\n"
-        "<code>/buscar Mac Mini M4 16 GB RAM 512 GB SSD</code>\n\n"
-        "Comandos: /buscar, /status, /teste e /ajuda"
+        "Busque qualquer produto e receba as cinco ofertas mais aderentes, com menor preço primeiro.\n\n"
+        "Exemplos:\n"
+        "<code>/buscar Mac Mini M4 16 GB RAM 512 GB SSD</code>\n"
+        "<code>/busca Teclado Logitech Pebble Keys 2 K380s</code>\n\n"
+        "Monitor automático:\n"
+        "<code>/monitorar Mac Mini M4 16 512 | 6300</code>\n\n"
+        "Comandos: /buscar, /monitorar, /monitores, /verificaragora, /parar, /historico, /status e /teste"
     )
 
 
 def comando_status(chat_id: int, thread_id: Optional[int]) -> None:
     mercado = "✅ conectado" if TOKENS.conectado() else "⚠️ não autorizado"
     modo = "rígido" if STRICT_CONFIGURATION else "flexível"
+    backend = "PostgreSQL" if STORE.is_postgres else "SQLite"
+    persistencia = (
+        f"✅ {backend} persistente"
+        if STORE.available and STORE.durable
+        else f"⚠️ {backend} local"
+        if STORE.available
+        else "❌ indisponível"
+    )
+    monitores = len(STORE.list_monitors(chat_id=chat_id, active_only=True))
     send_message(
         chat_id,
         "🤖 <b>STATUS</b>\n\n"
@@ -2246,10 +3309,39 @@ def comando_status(chat_id: int, thread_id: Optional[int]) -> None:
         "✅ Aplicação online\n"
         f"Mercado Livre: {mercado}\n"
         f"Filtro de configuração: {modo}\n"
-        f"Resultados por busca: {MAX_RESULTS}",
+        f"Resultados por busca: {MAX_RESULTS}\n"
+        f"Persistência: {persistencia}\n"
+        f"Monitores ativos: {monitores}",
         message_thread_id=thread_id,
         reply_markup=None if TOKENS.conectado() else link_oauth_keyboard(),
     )
+
+
+def solicitar_busca(
+    chat_id: int, thread_id: Optional[int], argumento: str
+) -> None:
+    if not TOKENS.conectado():
+        send_message(
+            chat_id,
+            "⚠️ <b>Mercado Livre não autorizado.</b>",
+            message_thread_id=thread_id,
+            reply_markup=link_oauth_keyboard(),
+        )
+    elif not argumento:
+        send_message(
+            chat_id,
+            "Use, por exemplo:\n"
+            "<code>/buscar Teclado Logitech Pebble Keys 2 K380s</code>",
+            message_thread_id=thread_id,
+        )
+    elif len(argumento) > 180:
+        send_message(chat_id, "❌ A busca é longa demais.", message_thread_id=thread_id)
+    elif not agendar_busca(chat_id, argumento, thread_id):
+        send_message(
+            chat_id,
+            "⏳ Já existe um garimpo em andamento neste chat.",
+            message_thread_id=thread_id,
+        )
 
 
 def comando_teste(chat_id: int, thread_id: Optional[int]) -> None:
@@ -2304,6 +3396,7 @@ def webhook():
         return "OK", 200
 
     texto = primeiro_texto(message.get("text"))
+    chat_type = primeiro_texto(chat.get("type")).lower()
     thread_id = message.get("message_thread_id")
     try:
         thread_id = int(thread_id) if thread_id is not None else None
@@ -2317,34 +3410,34 @@ def webhook():
         comando_status(chat_id, thread_id)
     elif comando == "/teste":
         comando_teste(chat_id, thread_id)
-    elif comando == "/buscar":
+    elif comando in {"/buscar", "/busca", "/pesquisar", "/pesquisa", "/search"}:
+        solicitar_busca(chat_id, thread_id, argumento)
+    elif comando == "/monitorar":
         if not TOKENS.conectado():
             send_message(
                 chat_id,
-                "⚠️ <b>Mercado Livre não autorizado.</b>",
+                "⚠️ Autorize o Mercado Livre antes de criar um monitor.",
                 message_thread_id=thread_id,
                 reply_markup=link_oauth_keyboard(),
             )
-        elif not argumento:
-            send_message(
-                chat_id,
-                "Use, por exemplo:\n"
-                "<code>/buscar Mac Mini M4 16 GB RAM 512 GB SSD</code>",
-                message_thread_id=thread_id,
-            )
-        elif len(argumento) > 180:
-            send_message(chat_id, "❌ A busca é longa demais.", message_thread_id=thread_id)
-        elif not agendar_busca(chat_id, argumento, thread_id):
-            send_message(
-                chat_id,
-                "⏳ Já existe um garimpo em andamento neste chat.",
-                message_thread_id=thread_id,
-            )
+        else:
+            comando_monitorar(chat_id, thread_id, argumento)
+    elif comando in {"/monitores", "/alertas"}:
+        comando_monitores(chat_id, thread_id)
+    elif comando in {"/verificaragora", "/verificar"}:
+        EXECUTOR.submit(executar_verificacao_manual, chat_id, thread_id)
+    elif comando in {"/parar", "/desativar"}:
+        comando_parar(chat_id, thread_id, argumento)
+    elif comando == "/historico":
+        comando_historico(chat_id, thread_id, argumento)
+    elif not comando and argumento and chat_type == "private":
+        solicitar_busca(chat_id, thread_id, argumento)
     else:
         send_message(
             chat_id,
-            "Envie uma busca assim:\n"
-            "<code>/buscar Mac Mini M4 16 GB RAM 512 GB SSD</code>",
+            "Comando não reconhecido. Use:\n"
+            "<code>/buscar nome do produto</code>\n"
+            "ou envie apenas o nome do produto em conversa privada.",
             message_thread_id=thread_id,
         )
     return "OK", 200
@@ -2356,5 +3449,9 @@ def webhook():
 
 
 if __name__ == "__main__":
+    if "--monitor-once" in sys.argv:
+        resultado_monitor = executar_monitores()
+        print(json.dumps(resultado_monitor, ensure_ascii=False))
+        raise SystemExit(0 if resultado_monitor["errors"] == 0 else 1)
     port = env_int("PORT", 10000, 1, 65535)
     app.run(host="0.0.0.0", port=port, threaded=True)
