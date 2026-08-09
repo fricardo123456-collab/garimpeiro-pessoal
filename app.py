@@ -14,6 +14,9 @@ O arquivo usa apenas Flask e requests como dependências externas.
 
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
 import html
 import hmac
 import json
@@ -1981,29 +1984,91 @@ def agendar_busca(chat_id: int, termo: str, message_thread_id: Optional[int]) ->
 # =============================================================================
 
 
-OAUTH_STATES: dict[str, float] = {}
-OAUTH_STATE_LOCK = threading.Lock()
 OAUTH_STATE_TTL = 600
+OAUTH_CLOCK_SKEW = 60
+
+
+def base64_url_encode(valor: bytes) -> str:
+    return base64.urlsafe_b64encode(valor).rstrip(b"=").decode("ascii")
+
+
+def base64_url_decode(valor: str) -> bytes:
+    padding = "=" * (-len(valor) % 4)
+    return base64.urlsafe_b64decode((valor + padding).encode("ascii"))
 
 
 def criar_oauth_state() -> str:
-    agora = time.time()
-    state = secrets.token_urlsafe(32)
-    with OAUTH_STATE_LOCK:
-        expirados = [chave for chave, expira in OAUTH_STATES.items() if expira <= agora]
-        for chave in expirados:
-            OAUTH_STATES.pop(chave, None)
-        OAUTH_STATES[state] = agora + OAUTH_STATE_TTL
-    return state
+    """Cria state assinado, válido mesmo se o callback cair em outro worker."""
+    segredo = MELI_CLIENT_SECRET.encode("utf-8")
+    emitido_em = int(time.time())
+    nonce = secrets.token_urlsafe(18)
+    payload = f"{emitido_em}.{nonce}".encode("utf-8")
+    assinatura = hmac.new(segredo, payload, hashlib.sha256).digest()
+    return f"{base64_url_encode(payload)}.{base64_url_encode(assinatura)}"
 
 
 def consumir_oauth_state(state: str) -> bool:
-    if not state:
+    """Valida assinatura e idade sem depender da memória do processo."""
+    if not state or not MELI_CLIENT_SECRET:
         return False
-    agora = time.time()
-    with OAUTH_STATE_LOCK:
-        expira = OAUTH_STATES.pop(state, None)
-    return bool(expira and expira > agora)
+    try:
+        payload_b64, assinatura_b64 = state.split(".", 1)
+        payload = base64_url_decode(payload_b64)
+        assinatura = base64_url_decode(assinatura_b64)
+        esperada = hmac.new(
+            MELI_CLIENT_SECRET.encode("utf-8"), payload, hashlib.sha256
+        ).digest()
+        if not hmac.compare_digest(assinatura, esperada):
+            return False
+        emitido_texto, nonce = payload.decode("utf-8").split(".", 1)
+        emitido_em = int(emitido_texto)
+        idade = int(time.time()) - emitido_em
+        return bool(nonce and -OAUTH_CLOCK_SKEW <= idade <= OAUTH_STATE_TTL)
+    except (ValueError, TypeError, UnicodeDecodeError, binascii.Error):
+        return False
+
+
+def pagina_oauth(
+    titulo: str,
+    mensagem: str,
+    *,
+    sucesso: bool,
+    mostrar_botao: bool = False,
+) -> str:
+    cor = "#16a34a" if sucesso else "#dc2626"
+    icone = "✓" if sucesso else "!"
+    botao = ""
+    if mostrar_botao:
+        botao = (
+            f'<a class="button" href="{html.escape(APP_BASE_URL)}/oauth/login">'
+            "Conectar novamente</a>"
+        )
+    return f"""<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{html.escape(titulo)}</title>
+  <style>
+    * {{ box-sizing: border-box; }}
+    body {{ margin: 0; min-height: 100vh; display: grid; place-items: center;
+      padding: 24px; background: #f6f7f9; color: #111827;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
+    .card {{ width: min(100%, 430px); padding: 34px 28px; border-radius: 24px;
+      background: white; box-shadow: 0 18px 55px rgba(17,24,39,.10); text-align: center; }}
+    .icon {{ width: 58px; height: 58px; margin: 0 auto 18px; display: grid;
+      place-items: center; border-radius: 50%; color: white; background: {cor};
+      font-size: 32px; font-weight: 800; }}
+    h1 {{ margin: 0 0 12px; font-size: 24px; }}
+    p {{ margin: 0; color: #4b5563; font-size: 16px; line-height: 1.55; }}
+    .button {{ display: block; margin-top: 24px; padding: 15px 18px;
+      border-radius: 14px; background: #111827; color: white;
+      font-weight: 700; text-decoration: none; }}
+  </style>
+</head>
+<body><main class="card"><div class="icon">{icone}</div>
+<h1>{html.escape(titulo)}</h1><p>{html.escape(mensagem)}</p>{botao}</main></body>
+</html>"""
 
 
 @app.get("/")
@@ -2032,7 +2097,11 @@ def health():
 @app.get("/oauth/login")
 def oauth_login():
     if not MELI_CLIENT_ID or not MELI_CLIENT_SECRET:
-        return "MELI_CLIENT_ID ou MELI_CLIENT_SECRET não configurado.", 500
+        return pagina_oauth(
+            "Configuração incompleta",
+            "MELI_CLIENT_ID ou MELI_CLIENT_SECRET não está configurado no servidor.",
+            sucesso=False,
+        ), 500
     state = criar_oauth_state()
     parametros = {
         "response_type": "code",
@@ -2047,15 +2116,32 @@ def oauth_login():
 @app.get("/oauth/callback")
 def oauth_callback():
     if request.args.get("error"):
-        erro = html.escape(primeiro_texto(request.args.get("error_description"), request.args.get("error")))
-        return f"Autorização cancelada ou recusada: {erro}", 400
+        erro = primeiro_texto(
+            request.args.get("error_description"), request.args.get("error")
+        )
+        return pagina_oauth(
+            "Autorização não concluída",
+            f"O Mercado Livre cancelou ou recusou a autorização: {erro}",
+            sucesso=False,
+            mostrar_botao=True,
+        ), 400
 
     code = request.args.get("code", "").strip()
     state = request.args.get("state", "").strip()
     if not code:
-        return "Código OAuth não recebido.", 400
+        return pagina_oauth(
+            "Código não recebido",
+            "Inicie uma nova conexão para autorizar o Mercado Livre.",
+            sucesso=False,
+            mostrar_botao=True,
+        ), 400
     if not consumir_oauth_state(state):
-        return "Estado OAuth inválido ou expirado. Abra /oauth/login novamente.", 400
+        return pagina_oauth(
+            "Conexão expirada",
+            "Este link de autorização não é mais válido. Inicie uma nova conexão.",
+            sucesso=False,
+            mostrar_botao=True,
+        ), 400
 
     try:
         response = requests.post(
@@ -2075,19 +2161,33 @@ def oauth_callback():
         except ValueError:
             data = {}
     except requests.RequestException:
-        return "Falha de rede durante OAuth.", 502
+        return pagina_oauth(
+            "Falha de conexão",
+            "Não foi possível concluir a comunicação com o Mercado Livre. Tente novamente.",
+            sucesso=False,
+            mostrar_botao=True,
+        ), 502
 
     if response.status_code != 200:
-        mensagem = html.escape(primeiro_texto(data.get("message"), data.get("error"), "OAuth recusado"))
-        return f"Erro OAuth HTTP {response.status_code}: {mensagem}", 400
+        mensagem = primeiro_texto(data.get("message"), data.get("error"), "OAuth recusado")
+        return pagina_oauth(
+            "Autorização recusada",
+            f"O Mercado Livre retornou HTTP {response.status_code}: {mensagem}",
+            sucesso=False,
+            mostrar_botao=True,
+        ), 400
     if not TOKENS.salvar_resposta_oauth(data):
-        return "Access token não recebido.", 400
-    return (
-        "✅ Mercado Livre conectado!<br><br>"
-        "Volte ao Telegram e envie:<br>"
-        "<b>/buscar Mac Mini M4 16 GB RAM 512 GB SSD</b>",
-        200,
-    )
+        return pagina_oauth(
+            "Token não recebido",
+            "A resposta não trouxe o token necessário. Tente autorizar novamente.",
+            sucesso=False,
+            mostrar_botao=True,
+        ), 400
+    return pagina_oauth(
+        "Mercado Livre conectado",
+        "A autorização foi concluída. Volte ao Telegram e envie sua busca.",
+        sucesso=True,
+    ), 200
 
 
 # =============================================================================
