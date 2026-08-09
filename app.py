@@ -1,5 +1,5 @@
 import os
-from urllib.parse import quote
+import json
 
 from flask import Flask, request, redirect
 import requests
@@ -64,7 +64,7 @@ def oauth_login():
 
 
 # =========================
-# CALLBACK / ACCESS TOKEN
+# CALLBACK / TOKEN
 # =========================
 
 @app.route("/oauth/callback")
@@ -85,21 +85,22 @@ def oauth_callback():
         "redirect_uri": MELI_REDIRECT_URI,
     }
 
-    response = requests.post(
-        MELI_TOKEN_URL,
-        data=payload,
-        timeout=20,
-    )
-
     try:
+        response = requests.post(
+            MELI_TOKEN_URL,
+            data=payload,
+            timeout=20,
+        )
+
         data = response.json()
+
     except Exception:
-        return "Erro ao interpretar resposta do Mercado Livre.", 500
+        return "Erro ao comunicar com o Mercado Livre.", 500
 
     if response.status_code != 200:
         return (
-            "❌ Não foi possível gerar o Access Token.<br><br>"
-            f"Status HTTP: {response.status_code}",
+            "❌ Não foi possível gerar o Access Token.<br>"
+            f"HTTP {response.status_code}",
             400,
         )
 
@@ -111,27 +112,29 @@ def oauth_callback():
 
     return (
         "✅ Mercado Livre conectado ao Garimpeiro Pessoal!<br><br>"
-        "🔐 Access Token recebido e armazenado pelo servidor.<br>"
-        "🤖 Agora você já pode testar /buscar no Telegram.",
+        "🔐 Access Token recebido pelo servidor.<br>"
+        "🤖 Agora teste /buscar novamente no Telegram.",
         200,
     )
 
 
 # =========================
-# BUSCA MERCADO LIVRE
+# DIAGNÓSTICO DA API
 # =========================
 
 def buscar_produto_meli(termo):
     if not meli_access_token:
         return {
             "ok": False,
-            "erro": "Mercado Livre não autorizado."
+            "status": None,
+            "erro": "Mercado Livre não autorizado.",
         }
 
     url = "https://api.mercadolibre.com/products/search"
 
     headers = {
-        "Authorization": f"Bearer {meli_access_token}"
+        "Authorization": f"Bearer {meli_access_token}",
+        "Accept": "application/json",
     }
 
     params = {
@@ -141,66 +144,89 @@ def buscar_produto_meli(termo):
         "limit": 5,
     }
 
-    response = requests.get(
-        url,
-        headers=headers,
-        params=params,
-        timeout=20,
-    )
-
-    if response.status_code != 200:
+    try:
+        response = requests.get(
+            url,
+            headers=headers,
+            params=params,
+            timeout=20,
+        )
+    except requests.RequestException as exc:
         return {
             "ok": False,
-            "status": response.status_code,
+            "status": None,
+            "erro": f"Falha de conexão: {str(exc)[:200]}",
         }
 
     try:
         data = response.json()
     except Exception:
-        return {
-            "ok": False,
-            "erro": "Resposta inválida da API."
+        data = {
+            "raw_response": response.text[:1000]
         }
 
-    results = data.get("results", [])
+    if response.status_code != 200:
+        return {
+            "ok": False,
+            "status": response.status_code,
+            "api_response": data,
+        }
 
     return {
         "ok": True,
-        "results": results,
+        "results": data.get("results", []),
+        "full_response": data,
     }
 
 
-def formatar_resultados_produtos(termo, results):
-    if not results:
-        return (
-            f"🔎 Busca: {termo}\n\n"
-            "Nenhum produto encontrado nessa consulta."
-        )
+def formatar_erro_api(resultado):
+    status = resultado.get("status")
+    data = resultado.get("api_response") or {}
 
     linhas = [
-        f"🔎 RESULTADOS PARA:\n{termo}",
+        "❌ MERCADO LIVRE RECUSOU A CONSULTA",
         "",
+        f"HTTP: {status}",
     ]
 
-    for i, item in enumerate(results[:5], start=1):
-        nome = item.get("name") or item.get("title") or "Produto sem nome"
-        product_id = item.get("id", "—")
+    if isinstance(data, dict):
+        error = data.get("error")
+        message = data.get("message")
+        cause = data.get("cause")
 
-        linhas.append(
-            f"{i}. {nome}\n"
-            f"ID: {product_id}"
-        )
-        linhas.append("")
+        if error:
+            linhas.append(f"error: {error}")
 
-    linhas.append(
-        "✅ Consulta feita diretamente na API do Mercado Livre."
-    )
+        if message:
+            linhas.append(f"message: {message}")
+
+        if cause:
+            texto_cause = json.dumps(
+                cause,
+                ensure_ascii=False
+            )
+
+            if len(texto_cause) > 1200:
+                texto_cause = texto_cause[:1200] + "..."
+
+            linhas.append(f"cause: {texto_cause}")
+
+        if not error and not message and not cause:
+            texto = json.dumps(
+                data,
+                ensure_ascii=False
+            )
+
+            if len(texto) > 1500:
+                texto = texto[:1500] + "..."
+
+            linhas.append(f"resposta: {texto}")
 
     return "\n".join(linhas)
 
 
 # =========================
-# TELEGRAM WEBHOOK
+# TELEGRAM
 # =========================
 
 @app.route("/webhook", methods=["POST"])
@@ -219,7 +245,6 @@ def webhook():
         send_message(
             chat_id,
             "👋 Bem-vindo ao Garimpeiro Pessoal!\n\n"
-            "🔎 Monitoramento inteligente de preços.\n\n"
             "Comandos:\n"
             "/status\n"
             "/buscar produto\n\n"
@@ -242,12 +267,16 @@ def webhook():
         )
 
     elif text.startswith("/buscar"):
-        termo = text.replace("/buscar", "", 1).strip()
+        termo = text.replace(
+            "/buscar",
+            "",
+            1
+        ).strip()
 
         if not termo:
             send_message(
                 chat_id,
-                "🔎 Digite o produto depois de /buscar.\n\n"
+                "🔎 Digite um produto.\n\n"
                 "Exemplo:\n"
                 "/buscar Mac Mini M4 16 512"
             )
@@ -261,34 +290,53 @@ def webhook():
         else:
             send_message(
                 chat_id,
-                f"🔎 Procurando por:\n{termo}\n\n"
-                "Aguarde..."
+                f"🔎 Testando a API para:\n{termo}"
             )
 
             resultado = buscar_produto_meli(termo)
 
             if not resultado.get("ok"):
-                status = resultado.get("status")
-
                 send_message(
                     chat_id,
-                    "❌ A consulta ao Mercado Livre não funcionou.\n\n"
-                    f"Status HTTP: {status}\n\n"
-                    "Isso é útil: agora sabemos exatamente como "
-                    "a API está respondendo e ajustamos o endpoint "
-                    "sem expor nenhuma credencial."
+                    formatar_erro_api(resultado)
                 )
 
             else:
-                mensagem = formatar_resultados_produtos(
-                    termo,
-                    resultado.get("results", [])
-                )
+                results = resultado.get("results", [])
 
-                send_message(
-                    chat_id,
-                    mensagem
-                )
+                if not results:
+                    send_message(
+                        chat_id,
+                        "✅ API respondeu HTTP 200.\n\n"
+                        "Nenhum produto foi retornado."
+                    )
+                else:
+                    linhas = [
+                        "✅ API respondeu HTTP 200!",
+                        "",
+                    ]
+
+                    for i, item in enumerate(
+                        results[:5],
+                        start=1
+                    ):
+                        nome = (
+                            item.get("name")
+                            or item.get("title")
+                            or "Produto"
+                        )
+
+                        product_id = item.get("id", "—")
+
+                        linhas.append(
+                            f"{i}. {nome}\n"
+                            f"ID: {product_id}\n"
+                        )
+
+                    send_message(
+                        chat_id,
+                        "\n".join(linhas)
+                    )
 
     return "OK", 200
 
