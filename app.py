@@ -1,700 +1,945 @@
 import os
+
 import json
-from decimal import Decimal, InvalidOperation
 
 from flask import Flask, request, redirect
+
 import requests
 
 app = Flask(__name__)
 
 # =========================================================
+
 # CONFIGURAÇÃO
+
 # =========================================================
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
 MELI_CLIENT_ID = os.environ.get("MELI_CLIENT_ID")
+
 MELI_CLIENT_SECRET = os.environ.get("MELI_CLIENT_SECRET")
 
 MELI_REDIRECT_URI = (
+
     "https://garimpeiro-pessoal.onrender.com/oauth/callback"
+
 )
 
 MELI_API = "https://api.mercadolibre.com"
+
 MELI_TOKEN_URL = f"{MELI_API}/oauth/token"
 
 meli_access_token = None
+
 meli_refresh_token = None
 
-
-# =========================================================
-# UTILIDADES
 # =========================================================
 
-def brl(valor):
-    try:
-        valor = Decimal(str(valor))
-        texto = f"{valor:,.2f}"
-        texto = texto.replace(",", "X").replace(".", ",").replace("X", ".")
-        return f"R$ {texto}"
-    except Exception:
-        return "—"
+# TELEGRAM
 
-
-def calcular_desconto(preco, original):
-    try:
-        preco = Decimal(str(preco))
-        original = Decimal(str(original))
-
-        if original <= 0 or preco >= original:
-            return None
-
-        return round(
-            float(((original - preco) / original) * 100),
-            1
-        )
-
-    except Exception:
-        return None
-
+# =========================================================
 
 def send_message(chat_id, text):
-    try:
-        requests.post(
-            f"{TELEGRAM_API}/sendMessage",
-            json={
-                "chat_id": chat_id,
-                "text": text,
-                "disable_web_page_preview": True,
-            },
-            timeout=20,
-        )
-    except Exception:
-        pass
 
+    try:
+
+        response = requests.post(
+
+            f"{TELEGRAM_API}/sendMessage",
+
+            json={
+
+                "chat_id": chat_id,
+
+                "text": text,
+
+                "disable_web_page_preview": True,
+
+            },
+
+            timeout=20,
+
+        )
+
+        return response.status_code == 200
+
+    except Exception:
+
+        return False
+
+# =========================================================
+
+# MERCADO LIVRE - REQUEST
+
+# =========================================================
 
 def meli_get(endpoint, params=None):
+
     if not meli_access_token:
+
         return {
+
             "ok": False,
+
             "status": None,
+
             "data": {},
-            "erro": "Mercado Livre não autorizado."
+
+            "error": "TOKEN_NOT_AVAILABLE",
+
+            "message": "Mercado Livre não autorizado."
+
         }
 
     try:
+
         response = requests.get(
+
             f"{MELI_API}{endpoint}",
+
             headers={
+
                 "Authorization": f"Bearer {meli_access_token}",
+
                 "Accept": "application/json",
+
             },
+
             params=params,
+
             timeout=25,
+
         )
 
         try:
+
             data = response.json()
+
         except Exception:
+
             data = {
-                "raw": response.text[:1500]
+
+                "raw_response": response.text[:1500]
+
             }
 
         return {
+
             "ok": response.status_code == 200,
+
             "status": response.status_code,
+
             "data": data,
+
         }
 
     except requests.RequestException as exc:
+
         return {
+
             "ok": False,
+
             "status": None,
+
             "data": {},
-            "erro": str(exc),
+
+            "error": "REQUEST_ERROR",
+
+            "message": str(exc),
+
         }
 
-
 # =========================================================
-# OAUTH
+
+# HOME
+
 # =========================================================
 
 @app.route("/")
+
 def home():
+
     return "Garimpeiro Pessoal online! 🤖", 200
 
+# =========================================================
+
+# OAUTH
+
+# =========================================================
 
 @app.route("/oauth/login")
+
 def oauth_login():
-    url = (
+
+    authorization_url = (
+
         "https://auth.mercadolivre.com.br/authorization"
+
         "?response_type=code"
+
         f"&client_id={MELI_CLIENT_ID}"
+
         f"&redirect_uri={MELI_REDIRECT_URI}"
+
     )
 
-    return redirect(url)
-
+    return redirect(authorization_url)
 
 @app.route("/oauth/callback")
+
 def oauth_callback():
+
     global meli_access_token
+
     global meli_refresh_token
 
     code = request.args.get("code")
 
     if not code:
+
         return "Código OAuth não recebido.", 400
 
     try:
+
         response = requests.post(
+
             MELI_TOKEN_URL,
+
             data={
+
                 "grant_type": "authorization_code",
+
                 "client_id": MELI_CLIENT_ID,
+
                 "client_secret": MELI_CLIENT_SECRET,
+
                 "code": code,
+
                 "redirect_uri": MELI_REDIRECT_URI,
+
             },
+
             timeout=25,
+
         )
 
         data = response.json()
 
     except Exception:
-        return "Erro ao comunicar com o Mercado Livre.", 500
+
+        return "Erro ao comunicar com Mercado Livre.", 500
 
     if response.status_code != 200:
+
         return (
+
             f"Erro OAuth HTTP {response.status_code}",
+
             400,
+
         )
 
     meli_access_token = data.get("access_token")
+
     meli_refresh_token = data.get("refresh_token")
 
     if not meli_access_token:
+
         return "Access Token não recebido.", 400
 
     return (
+
         "✅ Mercado Livre conectado!<br><br>"
-        "Volte ao Telegram e use /buscar.",
+
+        "Volte ao Telegram e envie /diagnostico.",
+
         200,
+
     )
 
-
-# =========================================================
-# CATÁLOGO
 # =========================================================
 
-def buscar_catalogo(termo, limit=20):
-    return meli_get(
-        "/products/search",
-        params={
-            "status": "active",
-            "site_id": "MLB",
-            "q": termo,
-            "limit": limit,
-        },
-    )
-
+# FORMATADORES
 
 # =========================================================
-# BUSCA DE ANÚNCIOS
-# =========================================================
 
-def buscar_anuncios_por_texto(termo, limit=50):
-    """
-    Busca anúncios comerciais reais no Mercado Livre Brasil.
-    """
+def extrair_erro(resultado):
 
-    return meli_get(
-        "/sites/MLB/search",
-        params={
-            "q": termo,
-            "limit": limit,
-        },
-    )
+    data = resultado.get("data") or {}
 
+    if not isinstance(data, dict):
 
-def buscar_anuncios_por_catalogo(product_id, limit=50):
-    """
-    Tenta localizar anúncios ligados diretamente
-    ao catalog_product_id.
-    """
+        return ""
 
-    return meli_get(
-        "/sites/MLB/search",
-        params={
-            "catalog_product_id": product_id,
-            "limit": limit,
-        },
-    )
+    partes = []
 
+    error = data.get("error")
 
-# =========================================================
-# ITEM INDIVIDUAL
-# =========================================================
+    message = data.get("message")
 
-def obter_item(item_id):
-    return meli_get(
-        f"/items/{item_id}"
-    )
+    cause = data.get("cause")
 
+    if error:
 
-# =========================================================
-# NORMALIZAÇÃO
-# =========================================================
+        partes.append(f"error={error}")
 
-def normalizar_item(item):
-    if "body" in item:
-        item = item.get("body") or {}
+    if message:
 
-    shipping = item.get("shipping") or {}
-    installments = item.get("installments") or {}
+        partes.append(f"message={message}")
 
-    preco = item.get("price")
-    original = item.get("original_price")
+    if cause:
 
-    parcelas = installments.get("quantity")
-    valor_parcela = installments.get("amount")
+        try:
 
-    total_parcelado = None
+            texto_cause = json.dumps(
 
-    try:
-        if parcelas and valor_parcela:
-            total_parcelado = (
-                Decimal(str(parcelas))
-                * Decimal(str(valor_parcela))
+                cause,
+
+                ensure_ascii=False
+
             )
-    except Exception:
-        pass
 
-    return {
-        "item_id": item.get("id"),
-        "titulo": item.get("title") or "Produto",
-        "preco": preco,
-        "preco_original": original,
-        "desconto": calcular_desconto(
-            preco,
-            original
-        ),
-        "parcelas": parcelas,
-        "valor_parcela": valor_parcela,
-        "total_parcelado": total_parcelado,
-        "sem_juros": installments.get("rate") in (0, 0.0),
-        "frete_gratis": shipping.get("free_shipping", False),
-        "condicao": item.get("condition"),
-        "seller_id": item.get("seller_id"),
-        "catalog_product_id": item.get("catalog_product_id"),
-        "official_store_id": item.get("official_store_id"),
-        "link": item.get("permalink"),
-        "estoque": item.get("available_quantity"),
-    }
+            if len(texto_cause) > 300:
 
+                texto_cause = texto_cause[:300] + "..."
+
+            partes.append(
+
+                f"cause={texto_cause}"
+
+            )
+
+        except Exception:
+
+            pass
+
+    return "\n".join(partes)
+
+def linha_teste(nome, resultado):
+
+    status = resultado.get("status")
+
+    if resultado.get("ok"):
+
+        simbolo = "✅"
+
+    elif status in (401, 403):
+
+        simbolo = "🔒"
+
+    elif status == 404:
+
+        simbolo = "⚠️"
+
+    else:
+
+        simbolo = "❌"
+
+    texto = (
+
+        f"{simbolo} {nome}\n"
+
+        f"HTTP: {status}"
+
+    )
+
+    erro = extrair_erro(resultado)
+
+    if erro:
+
+        texto += f"\n{erro}"
+
+    return texto
 
 # =========================================================
-# FILTROS
+
+# DIAGNÓSTICO
+
 # =========================================================
 
-def palavras_relevantes(termo):
-    ignorar = {
-        "de", "da", "do", "e", "com",
-        "-", "/", "apple"
-    }
+def executar_diagnostico():
 
-    return [
-        p.lower()
-        for p in termo.split()
-        if len(p) > 1
-        and p.lower() not in ignorar
+    resultados = []
+
+    # -----------------------------------------------------
+
+    # 1 - usuário autenticado
+
+    # -----------------------------------------------------
+
+    users_me = meli_get(
+
+        "/users/me"
+
+    )
+
+    resultados.append(
+
+        (
+
+            "1. /users/me",
+
+            users_me
+
+        )
+
+    )
+
+    user_id = None
+
+    if users_me.get("ok"):
+
+        user_id = (
+
+            users_me
+
+            .get("data", {})
+
+            .get("id")
+
+        )
+
+    # -----------------------------------------------------
+
+    # 2 - anúncios do próprio usuário
+
+    # -----------------------------------------------------
+
+    if user_id:
+
+        seller_items = meli_get(
+
+            f"/users/{user_id}/items/search",
+
+            params={
+
+                "status": "active",
+
+                "limit": 10,
+
+            },
+
+        )
+
+        resultados.append(
+
+            (
+
+                "2. /users/{id}/items/search",
+
+                seller_items
+
+            )
+
+        )
+
+    # -----------------------------------------------------
+
+    # 3 - busca geral de site
+
+    # -----------------------------------------------------
+
+    site_search = meli_get(
+
+        "/sites/MLB/search",
+
+        params={
+
+            "q": "Mac Mini M4",
+
+            "limit": 10,
+
+        },
+
+    )
+
+    resultados.append(
+
+        (
+
+            "3. /sites/MLB/search?q=Mac Mini M4",
+
+            site_search
+
+        )
+
+    )
+
+    # -----------------------------------------------------
+
+    # 4 - busca do catálogo
+
+    # -----------------------------------------------------
+
+    catalog_search = meli_get(
+
+        "/products/search",
+
+        params={
+
+            "site_id": "MLB",
+
+            "status": "active",
+
+            "q": "Mac Mini M4 16 512",
+
+            "limit": 5,
+
+        },
+
+    )
+
+    resultados.append(
+
+        (
+
+            "4. /products/search",
+
+            catalog_search
+
+        )
+
+    )
+
+    catalog_product_id = None
+
+    if catalog_search.get("ok"):
+
+        results = (
+
+            catalog_search
+
+            .get("data", {})
+
+            .get("results", [])
+
+        )
+
+        if results:
+
+            catalog_product_id = (
+
+                results[0].get("id")
+
+            )
+
+    # -----------------------------------------------------
+
+    # 5 - detalhe do produto
+
+    # -----------------------------------------------------
+
+    if catalog_product_id:
+
+        product_detail = meli_get(
+
+            f"/products/{catalog_product_id}"
+
+        )
+
+        resultados.append(
+
+            (
+
+                f"5. /products/{catalog_product_id}",
+
+                product_detail
+
+            )
+
+        )
+
+    # -----------------------------------------------------
+
+    # 6 - tentativa de busca no site por catalog_product_id
+
+    # -----------------------------------------------------
+
+    if catalog_product_id:
+
+        catalog_site_search = meli_get(
+
+            "/sites/MLB/search",
+
+            params={
+
+                "catalog_product_id": catalog_product_id,
+
+                "limit": 10,
+
+            },
+
+        )
+
+        resultados.append(
+
+            (
+
+                "6. /sites/MLB/search?catalog_product_id=...",
+
+                catalog_site_search
+
+            )
+
+        )
+
+    return resultados
+
+def resumo_diagnostico(resultados):
+
+    linhas = [
+
+        "🧪 DIAGNÓSTICO MERCADO LIVRE",
+
+        "",
+
     ]
 
+    for nome, resultado in resultados:
 
-def item_relevante(item, termo):
-    titulo = (
-        item.get("titulo")
-        or ""
-    ).lower()
-
-    palavras = palavras_relevantes(termo)
-
-    if not palavras:
-        return True
-
-    acertos = sum(
-        1 for palavra in palavras
-        if palavra in titulo
-    )
-
-    return acertos >= max(
-        2,
-        len(palavras) // 2
-    )
-
-
-# =========================================================
-# RANKING
-# =========================================================
-
-def score_oferta(oferta):
-    try:
-        preco = Decimal(
-            str(oferta.get("preco"))
-        )
-    except Exception:
-        return Decimal("999999999")
-
-    score = preco
-
-    if oferta.get("frete_gratis"):
-        score -= Decimal("10")
-
-    if oferta.get("sem_juros"):
-        score -= Decimal("5")
-
-    if oferta.get("official_store_id"):
-        score -= Decimal("3")
-
-    return score
-
-
-# =========================================================
-# APRESENTAÇÃO
-# =========================================================
-
-def mensagem_oferta(oferta, posicao):
-    linhas = []
-
-    if posicao == 1:
-        linhas.append("🏆 MELHOR OFERTA")
-    else:
-        linhas.append(f"🔹 OFERTA #{posicao}")
-
-    linhas.append("")
-    linhas.append(oferta["titulo"])
-    linhas.append("")
-
-    linhas.append(
-        f"💰 Preço: {brl(oferta['preco'])}"
-    )
-
-    if oferta.get("preco_original"):
         linhas.append(
-            f"Antes: {brl(oferta['preco_original'])}"
-        )
 
-    if oferta.get("desconto"):
-        linhas.append(
-            f"🔥 Desconto: {oferta['desconto']}%"
-        )
+            linha_teste(
 
-    parcelas = oferta.get("parcelas")
-    valor_parcela = oferta.get("valor_parcela")
+                nome,
 
-    if parcelas and valor_parcela:
-        texto = (
-            f"💳 {parcelas}x de "
-            f"{brl(valor_parcela)}"
-        )
+                resultado
 
-        if oferta.get("sem_juros"):
-            texto += " sem juros"
-
-        linhas.append(texto)
-
-        if oferta.get("total_parcelado"):
-            linhas.append(
-                "Total parcelado: "
-                f"{brl(oferta['total_parcelado'])}"
             )
 
-    if oferta.get("frete_gratis"):
-        linhas.append(
-            "🚚 Frete grátis"
         )
 
-    condicao = oferta.get("condicao")
-
-    if condicao:
-        traduzido = {
-            "new": "Novo",
-            "used": "Usado",
-        }.get(
-            condicao,
-            condicao
-        )
-
-        linhas.append(
-            f"📦 Condição: {traduzido}"
-        )
-
-    if oferta.get("official_store_id"):
-        linhas.append(
-            "🏪 Loja oficial"
-        )
-
-    if oferta.get("seller_id"):
-        linhas.append(
-            f"👤 Vendedor: {oferta['seller_id']}"
-        )
-
-    if oferta.get("estoque") is not None:
-        linhas.append(
-            f"📦 Estoque: {oferta['estoque']}"
-        )
-
-    if oferta.get("link"):
         linhas.append("")
-        linhas.append(
-            f"🔗 {oferta['link']}"
-        )
+
+    linhas.append(
+
+        "📌 Interpretação:"
+
+    )
+
+    linhas.append(
+
+        "HTTP 200 = rota liberada."
+
+    )
+
+    linhas.append(
+
+        "HTTP 403 = rota bloqueada por política/permissão."
+
+    )
+
+    linhas.append(
+
+        "HTTP 404 = rota/recurso não disponível."
+
+    )
 
     return "\n".join(linhas)
 
-
-# =========================================================
-# MOTOR DE BUSCA COMPLETO
 # =========================================================
 
-def garimpar_ofertas(termo):
-    # 1. Primeiro tenta busca direta dos anúncios
-    resultado = buscar_anuncios_por_texto(
-        termo,
-        limit=50,
-    )
+# EXTRA DE DIAGNÓSTICO
 
-    ofertas = []
+# =========================================================
 
-    if resultado.get("ok"):
-        resultados = (
+def contar_resultados(resultado):
+
+    data = resultado.get("data")
+
+    if not isinstance(data, dict):
+
+        return None
+
+    results = data.get("results")
+
+    if isinstance(results, list):
+
+        return len(results)
+
+    return None
+
+def diagnostico_detalhado(resultados):
+
+    linhas = [
+
+        "📊 RESUMO DOS RETORNOS",
+
+        "",
+
+    ]
+
+    for nome, resultado in resultados:
+
+        status = resultado.get("status")
+
+        linhas.append(
+
+            f"{nome}"
+
+        )
+
+        linhas.append(
+
+            f"HTTP {status}"
+
+        )
+
+        quantidade = contar_resultados(
+
             resultado
-            .get("data", {})
-            .get("results", [])
+
         )
 
-        for item in resultados:
-            oferta = normalizar_item(item)
+        if quantidade is not None:
 
-            if (
-                oferta.get("preco") is not None
-                and item_relevante(
-                    oferta,
-                    termo
-                )
-            ):
-                ofertas.append(oferta)
+            linhas.append(
 
-    # 2. Se não encontrou, tenta catálogo
-    if not ofertas:
-        catalogo = buscar_catalogo(
-            termo,
-            limit=10,
-        )
+                f"Resultados: {quantidade}"
 
-        if catalogo.get("ok"):
-            produtos = (
-                catalogo
-                .get("data", {})
-                .get("results", [])
             )
 
-            for produto in produtos[:3]:
-                product_id = produto.get("id")
+        data = resultado.get("data")
 
-                if not product_id:
-                    continue
+        if (
 
-                anuncios = buscar_anuncios_por_catalogo(
-                    product_id,
-                    limit=50,
+            resultado.get("ok")
+
+            and isinstance(data, dict)
+
+        ):
+
+            if "paging" in data:
+
+                paging = data.get(
+
+                    "paging",
+
+                    {}
+
                 )
 
-                if not anuncios.get("ok"):
-                    continue
+                total = paging.get(
 
-                resultados = (
-                    anuncios
-                    .get("data", {})
-                    .get("results", [])
+                    "total"
+
                 )
 
-                for item in resultados:
-                    oferta = normalizar_item(item)
+                if total is not None:
 
-                    if (
-                        oferta.get("preco") is not None
-                        and item_relevante(
-                            oferta,
-                            termo
-                        )
-                    ):
-                        ofertas.append(oferta)
+                    linhas.append(
 
-    # remove duplicados
-    unicos = {}
+                        f"Total informado pela API: {total}"
 
-    for oferta in ofertas:
-        item_id = oferta.get("item_id")
+                    )
 
-        if item_id:
-            unicos[item_id] = oferta
+        linhas.append("")
 
-    ofertas = list(
-        unicos.values()
-    )
-
-    ofertas.sort(
-        key=score_oferta
-    )
-
-    return ofertas
-
+    return "\n".join(linhas)
 
 # =========================================================
-# TELEGRAM
+
+# TELEGRAM WEBHOOK
+
 # =========================================================
 
-@app.route("/webhook", methods=["POST"])
+@app.route(
+
+    "/webhook",
+
+    methods=["POST"]
+
+)
+
 def webhook():
-    update = request.get_json(
-        silent=True
-    ) or {}
+
+    update = (
+
+        request.get_json(
+
+            silent=True
+
+        )
+
+        or {}
+
+    )
 
     message = update.get(
+
         "message",
+
         {}
+
     )
 
     chat_id = (
+
         message
+
         .get("chat", {})
+
         .get("id")
+
     )
 
     text = (
+
         message
+
         .get("text", "")
+
         .strip()
+
     )
 
     if not chat_id:
+
         return "OK", 200
 
     # -----------------------------------------------------
 
     if text.startswith("/start"):
+
         send_message(
+
             chat_id,
+
             "🤖 GARIMPEIRO PESSOAL\n\n"
-            "Agora busco anúncios reais, "
-            "preço e parcelamento.\n\n"
-            "Use:\n"
-            "/buscar Mac Mini M4 16 512"
+
+            "Modo diagnóstico ativo.\n\n"
+
+            "Comandos:\n"
+
+            "/status\n"
+
+            "/diagnostico"
+
         )
 
     # -----------------------------------------------------
 
     elif text.startswith("/status"):
-        status = (
-            "✅ Mercado Livre conectado"
-            if meli_access_token
-            else "⚠️ Mercado Livre não autorizado"
-        )
+
+        if meli_access_token:
+
+            status_ml = (
+
+                "✅ Mercado Livre conectado"
+
+            )
+
+        else:
+
+            status_ml = (
+
+                "⚠️ Mercado Livre não autorizado"
+
+            )
 
         send_message(
+
             chat_id,
+
             "🤖 STATUS\n\n"
+
             "✅ Telegram conectado\n"
+
             "✅ Render online\n"
-            f"{status}"
+
+            f"{status_ml}"
+
         )
 
     # -----------------------------------------------------
 
-    elif text.startswith("/buscar"):
-        termo = (
-            text
-            .replace(
-                "/buscar",
-                "",
-                1
-            )
-            .strip()
-        )
-
-        if not termo:
-            send_message(
-                chat_id,
-                "Use:\n"
-                "/buscar Mac Mini M4 16 512"
-            )
-
-            return "OK", 200
+    elif text.startswith("/diagnostico"):
 
         if not meli_access_token:
+
             send_message(
+
                 chat_id,
-                "⚠️ Mercado Livre não autorizado."
+
+                "⚠️ Mercado Livre não autorizado.\n\n"
+
+                "Abra:\n"
+
+                "https://garimpeiro-pessoal.onrender.com/oauth/login"
+
             )
 
             return "OK", 200
 
         send_message(
+
             chat_id,
-            "🔎 GARIMPANDO OFERTAS...\n\n"
-            f"{termo}"
+
+            "🧪 Iniciando diagnóstico das rotas...\n\n"
+
+            "Isso pode levar alguns segundos."
+
         )
 
-        ofertas = garimpar_ofertas(
-            termo
+        resultados = (
+
+            executar_diagnostico()
+
         )
-
-        if not ofertas:
-            send_message(
-                chat_id,
-                "❌ Não encontrei anúncios "
-                "com preço para essa busca."
-            )
-
-            return "OK", 200
 
         send_message(
+
             chat_id,
-            f"✅ {len(ofertas)} ofertas "
-            "relevantes encontradas.\n\n"
-            "Mostrando as melhores:"
+
+            resumo_diagnostico(
+
+                resultados
+
+            )
+
         )
 
-        for i, oferta in enumerate(
-            ofertas[:10],
-            start=1,
-        ):
-            send_message(
-                chat_id,
-                mensagem_oferta(
-                    oferta,
-                    i
-                )
+        send_message(
+
+            chat_id,
+
+            diagnostico_detalhado(
+
+                resultados
+
             )
+
+        )
 
     return "OK", 200
 
-
 # =========================================================
+
 # START
+
 # =========================================================
 
 if __name__ == "__main__":
+
     port = int(
+
         os.environ.get(
+
             "PORT",
+
             10000
+
         )
+
     )
 
     app.run(
+
         host="0.0.0.0",
+
         port=port
+
     )
