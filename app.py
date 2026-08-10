@@ -1,4 +1,4 @@
-"""Garimpeiro Pessoal — bot de ofertas Mercado Livre + Telegram.
+"""Garimpeiro Pessoal — bot multiloja de ofertas + Telegram.
 
 Objetivos desta versão:
 - validar a configuração no anúncio/variação, não apenas no produto de catálogo;
@@ -9,6 +9,10 @@ Objetivos desta versão:
 - entregar uma única mensagem compacta e editável no Telegram;
 - aceitar buscas genéricas, aliases de comando e texto livre em conversa privada;
 - manter monitores, histórico real de preços e alertas antifalso-positivo;
+- consultar Mercado Livre, Amazon e Shopee pelas APIs oficiais disponíveis;
+- aceitar OLX/Buscapé e outras lojas por um conector estruturado opcional;
+- separar preço confirmado de preço potencial com cupom;
+- avisar sobre cupons relevantes sem fingir que foram aceitos no carrinho;
 - manter OAuth, webhook e chamadas HTTP mais resilientes e seguros.
 
 Flask e requests são obrigatórios. psycopg é opcional e usado quando DATABASE_URL
@@ -36,6 +40,7 @@ import unicodedata
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -75,6 +80,23 @@ def env_float(nome: str, padrao: float, minimo: float, maximo: float) -> float:
     return max(minimo, min(maximo, valor))
 
 
+def bool_seguro(valor: Any, padrao: bool = False) -> bool:
+    """Converte booleanos de APIs sem tratar a string ``"false"`` como True."""
+
+    if isinstance(valor, bool):
+        return valor
+    if valor is None:
+        return padrao
+    if isinstance(valor, (int, float, Decimal)):
+        return valor != 0
+    texto = str(valor).strip().lower()
+    if texto in {"1", "true", "yes", "sim", "on", "enabled", "active"}:
+        return True
+    if texto in {"0", "false", "no", "nao", "não", "off", "disabled", "inactive", ""}:
+        return False
+    return padrao
+
+
 def env_csv_int(nome: str) -> set[int]:
     saida: set[int] = set()
     for parte in os.environ.get(nome, "").split(","):
@@ -87,6 +109,24 @@ def env_csv_int(nome: str) -> set[int]:
     return saida
 
 
+def env_csv_str(nome: str, padrao: str = "") -> list[str]:
+    return lista_unica_texto(
+        parte.strip().lower()
+        for parte in os.environ.get(nome, padrao).split(",")
+        if parte.strip()
+    )
+
+
+def lista_unica_texto(valores: Iterable[str]) -> list[str]:
+    vistos: set[str] = set()
+    saida: list[str] = []
+    for valor in valores:
+        if valor and valor not in vistos:
+            vistos.add(valor)
+            saida.append(valor)
+    return saida
+
+
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "").strip()
 TELEGRAM_ALLOWED_CHATS = env_csv_int("TELEGRAM_ALLOWED_CHATS")
@@ -96,6 +136,7 @@ MELI_CLIENT_SECRET = os.environ.get("MELI_CLIENT_SECRET", "").strip()
 MELI_API = "https://api.mercadolibre.com"
 MELI_TOKEN_URL = f"{MELI_API}/oauth/token"
 SITE_ID = os.environ.get("MELI_SITE_ID", "MLB").strip().upper() or "MLB"
+APP_VERSION = "3.0.0-multiloja"
 
 APP_BASE_URL = os.environ.get(
     "APP_BASE_URL", "https://garimpeiro-pessoal.onrender.com"
@@ -103,6 +144,87 @@ APP_BASE_URL = os.environ.get(
 MELI_REDIRECT_URI = os.environ.get(
     "MELI_REDIRECT_URI", f"{APP_BASE_URL}/oauth/callback"
 ).strip()
+
+# Fontes são ativadas automaticamente quando suas credenciais existem. Esta
+# lista permite desativar uma integração sem remover seus segredos do Render.
+ENABLED_SOURCES = set(
+    env_csv_str(
+        "ENABLED_SOURCES",
+        "mercadolivre,amazon,shopee,olx,buscape,universal",
+    )
+)
+
+MELI_SALE_PRICE_ENABLED = env_bool("MELI_SALE_PRICE_ENABLED", True)
+MELI_SALE_PRICE_LIMIT = env_int("MELI_SALE_PRICE_LIMIT", 20, 1, 100)
+
+AMAZON_CREATORS_CLIENT_ID = os.environ.get(
+    "AMAZON_CREATORS_CLIENT_ID", ""
+).strip()
+AMAZON_CREATORS_CLIENT_SECRET = os.environ.get(
+    "AMAZON_CREATORS_CLIENT_SECRET", ""
+).strip()
+AMAZON_CREATORS_CREDENTIAL_VERSION = os.environ.get(
+    "AMAZON_CREATORS_CREDENTIAL_VERSION", "3.1"
+).strip() or "3.1"
+AMAZON_PARTNER_TAG = os.environ.get("AMAZON_PARTNER_TAG", "").strip()
+AMAZON_MARKETPLACE = os.environ.get(
+    "AMAZON_MARKETPLACE", "www.amazon.com.br"
+).strip() or "www.amazon.com.br"
+AMAZON_CREATORS_API_URL = os.environ.get(
+    "AMAZON_CREATORS_API_URL", "https://creatorsapi.amazon"
+).strip().rstrip("/")
+AMAZON_CREATORS_TOKEN_URL = os.environ.get(
+    "AMAZON_CREATORS_TOKEN_URL", ""
+).strip()
+AMAZON_MAX_RESULTS = env_int("AMAZON_MAX_RESULTS", 10, 1, 10)
+AMAZON_ALLOW_MARKETPLACE_SELLERS = env_bool(
+    "AMAZON_ALLOW_MARKETPLACE_SELLERS", False
+)
+
+SHOPEE_AFFILIATE_APP_ID = os.environ.get(
+    "SHOPEE_AFFILIATE_APP_ID", ""
+).strip()
+SHOPEE_AFFILIATE_APP_SECRET = os.environ.get(
+    "SHOPEE_AFFILIATE_APP_SECRET", ""
+).strip()
+SHOPEE_AFFILIATE_API_URL = os.environ.get(
+    "SHOPEE_AFFILIATE_API_URL",
+    "https://open-api.affiliate.shopee.com.br/graphql",
+).strip()
+SHOPEE_MAX_RESULTS = env_int("SHOPEE_MAX_RESULTS", 20, 1, 50)
+SHOPEE_MIN_RATING = env_float("SHOPEE_MIN_RATING", 4.7, 0.0, 5.0)
+SHOPEE_MIN_SOLD = env_int("SHOPEE_MIN_SOLD", 50, 0, 100000000)
+
+# A API pública oficial da OLX não pesquisa o marketplace. GECKO_API_KEY é um
+# conector terceirizado opcional; sem ele o bot não raspa páginas nem burla o site.
+GECKO_API_KEY = os.environ.get("GECKO_API_KEY", "").strip()
+GECKO_API_URL = os.environ.get(
+    "GECKO_API_URL", "https://api.geckoapi.com.br/v1/extract"
+).strip()
+GECKO_OLX_STATE = os.environ.get("GECKO_OLX_STATE", "").strip().upper()
+GECKO_MAX_RESULTS = env_int("GECKO_MAX_RESULTS", 30, 1, 100)
+OLX_ALLOW_AUTOMATIC_ALERTS = env_bool("OLX_ALLOW_AUTOMATIC_ALERTS", False)
+
+# Conector universal: permite adicionar Buscapé e novas lojas sem editar este
+# arquivo. O contrato JSON aceito está documentado em /integrations/schema.
+UNIVERSAL_SEARCH_URL = os.environ.get("UNIVERSAL_SEARCH_URL", "").strip()
+UNIVERSAL_SEARCH_API_KEY = os.environ.get(
+    "UNIVERSAL_SEARCH_API_KEY", ""
+).strip()
+UNIVERSAL_TRUSTED_SOURCES = set(env_csv_str("UNIVERSAL_TRUSTED_SOURCES"))
+UNIVERSAL_MAX_RESULTS = env_int("UNIVERSAL_MAX_RESULTS", 40, 1, 200)
+
+# Cupons podem vir embutidos no conector universal, de JSON estático ou de feeds
+# HTTPS que sigam o mesmo contrato. Nunca são subtraídos do preço confirmado.
+COUPON_ALERTS_ENABLED = env_bool("COUPON_ALERTS_ENABLED", True)
+COUPON_MIN_PERCENT = env_float("COUPON_MIN_PERCENT", 30.0, 1.0, 100.0)
+COUPON_MIN_REAIS = env_float("COUPON_MIN_REAIS", 100.0, 1.0, 100000.0)
+COUPON_FEED_URLS = [
+    url.strip() for url in os.environ.get("COUPON_FEED_URLS", "").split(",")
+    if url.strip()
+]
+COUPONS_JSON = os.environ.get("COUPONS_JSON", "").strip()
+COUPON_CACHE_TTL = env_int("COUPON_CACHE_TTL", 300, 30, 86400)
 
 STRICT_CONFIGURATION = env_bool("STRICT_CONFIGURATION", True)
 DEFAULT_CONDITION = os.environ.get("DEFAULT_CONDITION", "new").strip().lower()
@@ -235,6 +357,8 @@ class TTLCache:
 
 ITEM_CACHE = TTLCache(ITEM_CACHE_TTL, max_items=2000)
 SELLER_CACHE = TTLCache(SELLER_CACHE_TTL, max_items=1000)
+SALE_PRICE_CACHE = TTLCache(ITEM_CACHE_TTL, max_items=2000)
+COUPON_CACHE = TTLCache(COUPON_CACHE_TTL, max_items=100)
 
 
 def normalizar_texto(texto: Any) -> str:
@@ -625,7 +749,7 @@ class PersistentStore:
                 uuid.uuid4().hex,
                 monitor_id,
                 checked_at,
-                offer.item_id,
+                getattr(offer, "signal_id", offer.item_id),
                 offer.seller_id,
                 price_cents,
                 reputation,
@@ -1026,6 +1150,64 @@ def obter_vendedor(seller_id: Any) -> dict[str, Any]:
         SELLER_CACHE.set(chave, resultado.data)
         return resultado.data
     return {}
+
+
+def obter_sale_price(item_id: str) -> dict[str, Any]:
+    """Obtém o preço vencedor atual pela Price API do Mercado Livre.
+
+    Esse endpoint é a fonte autoritativa para preço/promowinning. Cupons de
+    checkout não são presumidos aqui, porque podem depender de conta, forma de
+    pagamento, limite de uso e saldo da campanha.
+    """
+    if not MELI_SALE_PRICE_ENABLED or not item_id:
+        return {}
+    cache = SALE_PRICE_CACHE.get(item_id)
+    if isinstance(cache, dict):
+        return cache
+    resultado = meli_get(
+        f"/items/{item_id}/sale_price",
+        params={"context": "channel_marketplace"},
+    )
+    if resultado.ok and isinstance(resultado.data, dict):
+        SALE_PRICE_CACHE.set(item_id, resultado.data)
+        return resultado.data
+    return {}
+
+
+def aplicar_sale_price(oferta: Any, sale_price: dict[str, Any]) -> None:
+    if not isinstance(sale_price, dict) or not sale_price:
+        return
+    atual = decimal_seguro(
+        sale_price.get("amount")
+        or sale_price.get("price")
+        or obter_dict(sale_price, "sale_price").get("amount")
+    )
+    regular = decimal_seguro(
+        sale_price.get("regular_amount")
+        or sale_price.get("original_price")
+        or obter_dict(sale_price, "sale_price").get("regular_amount")
+    )
+    if atual is not None and atual > 0:
+        oferta.price = atual
+    if regular is not None and regular > oferta.price:
+        oferta.original_price = regular
+
+    metadados = sale_price.get("metadata")
+    if not isinstance(metadados, dict):
+        metadados = {}
+    ids: list[str] = []
+    for chave in ("promotion_id", "campaign_id", "deal_id"):
+        valor = primeiro_texto(sale_price.get(chave), metadados.get(chave))
+        if valor:
+            ids.append(valor)
+    oferta.deal_ids = lista_unica([*oferta.deal_ids, *ids])
+    rotulo = primeiro_texto(
+        sale_price.get("promotion_type"),
+        sale_price.get("price_type"),
+        metadados.get("promotion_type"),
+    )
+    if rotulo:
+        oferta.promotion_label = limitar_texto(rotulo.replace("_", " "), 42)
 
 
 # =============================================================================
@@ -1782,6 +1964,83 @@ class InstallmentInfo:
 
 
 @dataclass
+class CouponInfo:
+    """Cupom conhecido, mas ainda sujeito à validação no carrinho."""
+
+    coupon_id: str = ""
+    code: str = ""
+    label: str = ""
+    discount_type: str = "unknown"  # percent, fixed ou unknown
+    value: Optional[Decimal] = None
+    min_purchase: Optional[Decimal] = None
+    max_discount: Optional[Decimal] = None
+    starts_at: Optional[int] = None
+    expires_at: Optional[int] = None
+    terms_verified: bool = False
+    buyer_specific: bool = False
+    url: str = ""
+    source: str = ""
+
+    def active(self, now: Optional[int] = None) -> bool:
+        instante = int(time.time()) if now is None else int(now)
+        if self.starts_at is not None and instante < self.starts_at:
+            return False
+        if self.expires_at is not None and instante > self.expires_at:
+            return False
+        return True
+
+    def discount_for(self, price: Decimal) -> Optional[Decimal]:
+        if not self.active() or price <= 0:
+            return None
+        if self.min_purchase is not None and price < self.min_purchase:
+            return None
+        valor = self.value
+        if valor is None or valor <= 0:
+            return None
+        tipo = normalizar_texto(self.discount_type)
+        if tipo in {"percent", "percentage", "porcentagem", "percentual"}:
+            desconto = price * valor / Decimal("100")
+        elif tipo in {"fixed", "amount", "valor", "reais"}:
+            desconto = valor
+        else:
+            return None
+        if self.max_discount is not None and self.max_discount > 0:
+            desconto = min(desconto, self.max_discount)
+        return min(price, desconto.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+    def estimated_price(self, price: Decimal) -> Optional[Decimal]:
+        desconto = self.discount_for(price)
+        if desconto is None:
+            return None
+        return max(Decimal("0"), price - desconto).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP
+        )
+
+    def is_good(self, price: Decimal) -> bool:
+        desconto = self.discount_for(price)
+        if desconto is None:
+            return False
+        percentual = desconto / price * Decimal("100") if price > 0 else Decimal("0")
+        return bool(
+            desconto >= Decimal(str(COUPON_MIN_REAIS))
+            or percentual >= Decimal(str(COUPON_MIN_PERCENT))
+        )
+
+    def fingerprint(self) -> str:
+        base = "|".join(
+            [
+                self.source,
+                self.coupon_id,
+                self.code,
+                self.discount_type,
+                str(self.value or ""),
+                str(self.expires_at or ""),
+            ]
+        )
+        return hashlib.sha256(base.encode("utf-8")).hexdigest()[:12]
+
+
+@dataclass
 class Offer:
     item_id: str
     product_id: str
@@ -1802,12 +2061,34 @@ class Offer:
     deal_ids: list[str]
     confidence: int
     seller: dict[str, Any] = field(default_factory=dict)
+    source: str = "mercadolivre"
+    source_label: str = "Mercado Livre"
+    seller_name: str = ""
+    seller_trusted: Optional[bool] = None
+    rating: Optional[Decimal] = None
+    rating_count: int = 0
+    sold_count: int = 0
+    coupon: Optional[CouponInfo] = None
+    promotion_label: str = ""
+    price_confirmed: bool = True
+    trust_reason: str = ""
+    raw_metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
     def total_price(self) -> Decimal:
         if self.shipping_cost is not None:
             return self.price + self.shipping_cost
         return self.price
+
+    @property
+    def estimated_coupon_price(self) -> Optional[Decimal]:
+        if self.coupon is None:
+            return None
+        return self.coupon.estimated_price(self.price)
+
+    @property
+    def signal_id(self) -> str:
+        return f"{self.source}:{self.item_id}"
 
 
 @dataclass
@@ -1821,6 +2102,8 @@ class SearchStats:
     rejected_unconfirmed: int = 0
     rejected_no_price: int = 0
     compatible: int = 0
+    sources_queried: int = 0
+    sources_succeeded: int = 0
 
 
 @dataclass
@@ -1831,6 +2114,225 @@ class SearchResult:
     offers: list[Offer]
     stats: SearchStats
     error: str = ""
+    sources_used: list[str] = field(default_factory=list)
+    provider_errors: dict[str, str] = field(default_factory=dict)
+    comparison_links: dict[str, str] = field(default_factory=dict)
+
+
+SOURCE_ALIASES = {
+    "ml": "mercadolivre",
+    "meli": "mercadolivre",
+    "mercado livre": "mercadolivre",
+    "mercadolivre": "mercadolivre",
+    "amazon": "amazon",
+    "shopee": "shopee",
+    "shoppe": "shopee",
+    "olx": "olx",
+    "buscape": "buscape",
+    "buscapé": "buscape",
+    "universal": "universal",
+}
+SOURCE_LABELS = {
+    "mercadolivre": "Mercado Livre",
+    "amazon": "Amazon",
+    "shopee": "Shopee",
+    "olx": "OLX",
+    "buscape": "Buscapé",
+    "universal": "Outras lojas",
+}
+
+
+def normalizar_fonte(valor: Any) -> str:
+    norm = normalizar_texto(valor).replace(" ", "")
+    if norm in {"ml", "meli", "mercadolivre"}:
+        return "mercadolivre"
+    if norm in {"shopee", "shoppe"}:
+        return "shopee"
+    if norm in {"buscape"}:
+        return "buscape"
+    return norm
+
+
+def timestamp_seguro(valor: Any) -> Optional[int]:
+    if valor in (None, ""):
+        return None
+    try:
+        numero = int(valor)
+        if numero > 10_000_000_000:
+            numero //= 1000
+        return numero if numero > 0 else None
+    except (TypeError, ValueError):
+        pass
+    try:
+        texto = str(valor).strip().replace("Z", "+00:00")
+        data = datetime.fromisoformat(texto)
+        if data.tzinfo is None:
+            data = data.replace(tzinfo=timezone.utc)
+        return int(data.timestamp())
+    except (TypeError, ValueError):
+        return None
+
+
+def coupon_from_raw(raw: Any, source: str = "") -> Optional[CouponInfo]:
+    if not isinstance(raw, dict):
+        return None
+    status = normalizar_texto(raw.get("status"))
+    if status in {"paused", "finished", "expired", "cancelled", "canceled", "inactive"}:
+        return None
+    remaining = decimal_seguro(raw.get("remaining_budget"))
+    if remaining is not None and remaining <= 0:
+        return None
+    tipo = primeiro_texto(
+        raw.get("discount_type"), raw.get("type"), raw.get("kind")
+    ).lower()
+    percentual = decimal_seguro(
+        raw.get("percent")
+        or raw.get("percentage")
+        or raw.get("percent_off")
+        or raw.get("discount_percentage")
+    )
+    fixo = decimal_seguro(
+        raw.get("amount")
+        or raw.get("value")
+        or raw.get("amount_off")
+        or raw.get("fixed_amount")
+    )
+    if percentual is not None:
+        tipo, valor = "percent", percentual
+    elif tipo in {"percent", "percentage", "porcentagem", "percentual"}:
+        valor = fixo
+        tipo = "percent"
+    else:
+        valor = fixo
+        if valor is not None:
+            tipo = "fixed"
+    cupom = CouponInfo(
+        coupon_id=primeiro_texto(raw.get("id"), raw.get("coupon_id")),
+        code=primeiro_texto(raw.get("code"), raw.get("coupon_code")),
+        label=primeiro_texto(raw.get("label"), raw.get("title"), raw.get("name")),
+        discount_type=tipo or "unknown",
+        value=valor,
+        min_purchase=decimal_seguro(
+            raw.get("min_purchase") or raw.get("minimum_purchase") or raw.get("min_value")
+            or raw.get("min_purchase_amount")
+        ),
+        max_discount=decimal_seguro(
+            raw.get("max_discount") or raw.get("maximum_discount") or raw.get("max_refund")
+        ),
+        starts_at=timestamp_seguro(
+            raw.get("starts_at") or raw.get("start_at") or raw.get("start_date")
+        ),
+        expires_at=timestamp_seguro(
+            raw.get("expires_at")
+            or raw.get("end_at")
+            or raw.get("expiration")
+            or raw.get("finish_date")
+            or raw.get("end_date")
+        ),
+        terms_verified=bool_seguro(
+            raw.get("terms_verified")
+            if raw.get("terms_verified") is not None
+            else raw.get("verified")
+        ),
+        buyer_specific=bool_seguro(
+            raw.get("buyer_specific")
+            if raw.get("buyer_specific") is not None
+            else raw.get("personalized")
+        ),
+        url=primeiro_texto(raw.get("url"), raw.get("terms_url")),
+        source=normalizar_fonte(raw.get("source") or source),
+    )
+    if cupom.value is None or cupom.value <= 0 or not cupom.active():
+        return None
+    return cupom
+
+
+def extrair_cupons_payload(payload: Any, source: str = "") -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if not isinstance(payload, dict):
+        return []
+    for chave in ("coupons", "results", "items", "offers"):
+        itens = payload.get(chave)
+        if isinstance(itens, list):
+            return [item for item in itens if isinstance(item, dict)]
+    return [payload] if coupon_from_raw(payload, source) else []
+
+
+def carregar_cupons_feed() -> list[dict[str, Any]]:
+    cache = COUPON_CACHE.get("all")
+    if isinstance(cache, list):
+        return cache
+    saida: list[dict[str, Any]] = []
+    if COUPONS_JSON:
+        try:
+            saida.extend(extrair_cupons_payload(json.loads(COUPONS_JSON)))
+        except (TypeError, ValueError):
+            logger.warning("COUPONS_JSON inválido; cupons estáticos ignorados")
+    for url in COUPON_FEED_URLS:
+        try:
+            parsed = urlparse(url)
+            if parsed.scheme != "https" or not parsed.hostname:
+                logger.warning("Feed de cupons não HTTPS ignorado: %s", url)
+                continue
+            resposta = HTTP.get(url, timeout=TIMEOUT)
+            if 200 <= resposta.status_code < 300:
+                saida.extend(extrair_cupons_payload(resposta.json()))
+            else:
+                logger.info("Feed de cupons retornou HTTP %s", resposta.status_code)
+        except (requests.RequestException, ValueError):
+            logger.warning("Falha ao consultar feed de cupons", exc_info=True)
+    COUPON_CACHE.set("all", saida)
+    return saida
+
+
+def cupom_combina(raw: dict[str, Any], oferta: Offer, termo: str) -> bool:
+    fontes = raw.get("sources") or raw.get("source") or []
+    if isinstance(fontes, str):
+        fontes = [fontes]
+    fontes_norm = {normalizar_fonte(v) for v in fontes if v}
+    if fontes_norm and oferta.source not in fontes_norm and "all" not in fontes_norm:
+        return False
+    ids = raw.get("item_ids") or raw.get("product_ids") or []
+    if isinstance(ids, str):
+        ids = [ids]
+    if ids and oferta.item_id not in {str(v) for v in ids} and oferta.product_id not in {
+        str(v) for v in ids
+    }:
+        return False
+    vendedores = raw.get("seller_ids") or raw.get("sellers") or []
+    if isinstance(vendedores, str):
+        vendedores = [vendedores]
+    vendedor_norm = normalizar_texto(oferta.seller_name or oferta.seller_id)
+    if vendedores and not any(
+        normalizar_texto(v) in vendedor_norm for v in vendedores if v
+    ):
+        return False
+    palavras = raw.get("keywords") or raw.get("terms") or []
+    if isinstance(palavras, str):
+        palavras = [p.strip() for p in palavras.split(",") if p.strip()]
+    alvo = normalizar_texto(f"{oferta.title} {termo}")
+    if palavras and not all(normalizar_texto(p) in alvo for p in palavras if p):
+        return False
+    return True
+
+
+def anexar_melhor_cupom(oferta: Offer, termo: str, feeds: list[dict[str, Any]]) -> None:
+    candidatos: list[CouponInfo] = []
+    if oferta.coupon is not None:
+        candidatos.append(oferta.coupon)
+    for raw in feeds:
+        if cupom_combina(raw, oferta, termo):
+            cupom = coupon_from_raw(raw, oferta.source)
+            if cupom:
+                candidatos.append(cupom)
+    validos = [
+        (cupom.discount_for(oferta.price), cupom)
+        for cupom in candidatos
+        if cupom.discount_for(oferta.price) is not None
+    ]
+    if validos:
+        oferta.coupon = max(validos, key=lambda par: par[0] or Decimal("0"))[1]
 
 
 def extrair_preco(raw: dict[str, Any], detail: dict[str, Any]) -> Optional[Decimal]:
@@ -2105,10 +2607,19 @@ def chave_ranking(oferta: Offer) -> tuple[Any, ...]:
         "2_orange": 3,
         "1_red": 4,
     }.get(level, 5)
-    return (frete_desconhecido, valor, ordem_level, -oferta.confidence, oferta.item_id)
+    confiavel = oferta.seller_trusted is True or ordem_level <= 1
+    return (
+        frete_desconhecido,
+        valor,
+        not confiavel,
+        ordem_level,
+        -oferta.confidence,
+        oferta.source,
+        oferta.item_id,
+    )
 
 
-def buscar_ofertas_completas(
+def buscar_mercado_livre(
     termo: str, limite_resultados: int = MAX_RESULTS
 ) -> SearchResult:
     limite_resultados = max(1, min(int(limite_resultados), MAX_OFFERS_TO_ENRICH))
@@ -2221,6 +2732,16 @@ def buscar_ofertas_completas(
 
     stats.compatible = len(ofertas)
 
+    # Confirma o preço vencedor atual na API de preços. Isso inclui promoções
+    # públicas do anúncio, mas não inventa cupom de checkout.
+    ofertas.sort(key=lambda o: (o.price, -o.confidence, o.item_id))
+    candidatas_preco = ofertas[:MELI_SALE_PRICE_LIMIT]
+    if candidatas_preco:
+        with ThreadPoolExecutor(max_workers=min(4, len(candidatas_preco))) as pool:
+            precos = list(pool.map(lambda o: obter_sale_price(o.item_id), candidatas_preco))
+        for oferta, sale_price in zip(candidatas_preco, precos):
+            aplicar_sale_price(oferta, sale_price)
+
     # Consulta de frete apenas para uma faixa curta dos menores preços. Sem CEP, o
     # ranking permanece estritamente pelo preço atual anunciado.
     ofertas.sort(key=lambda o: (o.price, -o.confidence, o.item_id))
@@ -2234,9 +2755,999 @@ def buscar_ofertas_completas(
         if oferta.seller_id and oferta.seller_id not in sellers:
             sellers[oferta.seller_id] = obter_vendedor(oferta.seller_id)
         oferta.seller = sellers.get(oferta.seller_id, {})
+        oferta.seller_name = primeiro_texto(oferta.seller.get("nickname"))
+        oferta.seller_trusted = reputation_level(oferta) in SAFE_REPUTATION_LEVELS
 
     ofertas.sort(key=chave_ranking)
-    return SearchResult(True, 200, spec, ofertas[:limite_resultados], stats)
+    return SearchResult(
+        True,
+        200,
+        spec,
+        ofertas[:limite_resultados],
+        stats,
+        sources_used=["mercadolivre"],
+    )
+
+
+# =============================================================================
+# CONECTORES DE OUTRAS LOJAS E AGREGAÇÃO MULTILOJA
+# =============================================================================
+
+
+AMAZON_TOKEN_LOCK = threading.Lock()
+AMAZON_TOKEN_STATE: dict[str, Any] = {"access_token": "", "expires_at": 0}
+
+
+def valor_caminho(objeto: Any, *caminho: Any) -> Any:
+    atual = objeto
+    for chave in caminho:
+        if isinstance(chave, int):
+            if not isinstance(atual, list) or chave >= len(atual):
+                return None
+            atual = atual[chave]
+        else:
+            if not isinstance(atual, dict):
+                return None
+            atual = atual.get(chave)
+    return atual
+
+
+def link_https(valor: Any) -> str:
+    texto = primeiro_texto(valor)
+    try:
+        parsed = urlparse(texto)
+        if parsed.scheme == "https" and parsed.hostname:
+            return texto
+    except ValueError:
+        pass
+    return ""
+
+
+def normalizar_condicao_externa(valor: Any, padrao: str = "new") -> str:
+    norm = normalizar_texto(valor)
+    if any(t in norm for t in ("used", "usado", "seminovo", "pre owned")):
+        return "used"
+    if any(t in norm for t in ("refurbished", "recondicionado", "renewed")):
+        return "refurbished"
+    if any(t in norm for t in ("new", "novo", "lacrado")):
+        return "new"
+    return padrao
+
+
+def atributos_textuais(texto: str) -> list[dict[str, str]]:
+    """Transforma descrições externas em atributos reconhecíveis pelo filtro."""
+    norm = normalizar_texto(texto)
+    atributos: list[dict[str, str]] = []
+    ram = valor_proximo_a_marcador(
+        norm, r"ram|memoria(?:\s+ram)?|memoria\s+unificada|unified\s+memory"
+    )
+    storage = valor_proximo_a_marcador(
+        norm, r"ssd|nvme|armazenamento|storage|memoria\s+interna|rom|hd"
+    )
+    if ram is not None:
+        atributos.append(
+            {"id": "RAM_MEMORY", "name": "Memória RAM", "value_name": f"{ram} GB"}
+        )
+    if storage is not None:
+        atributos.append(
+            {
+                "id": "STORAGE_CAPACITY",
+                "name": "Capacidade de armazenamento",
+                "value_name": formatar_capacidade(storage),
+            }
+        )
+    return atributos
+
+
+def criar_oferta_externa(
+    *,
+    spec: SearchSpec,
+    source: str,
+    item_id: Any,
+    product_id: Any,
+    title: Any,
+    price: Any,
+    original_price: Any = None,
+    link: Any = "",
+    seller_id: Any = "",
+    seller_name: Any = "",
+    condition: Any = "new",
+    warranty: Any = "",
+    free_shipping: Optional[bool] = None,
+    shipping_cost: Any = None,
+    city: Any = "",
+    state: Any = "",
+    rating: Any = None,
+    rating_count: Any = 0,
+    sold_count: Any = 0,
+    seller_trusted: Optional[bool] = None,
+    trust_reason: str = "",
+    evidence_text: str = "",
+    promotion_label: str = "",
+    coupon_raw: Any = None,
+    raw_metadata: Optional[dict[str, Any]] = None,
+) -> tuple[Optional[Offer], MatchResult]:
+    titulo = primeiro_texto(title, "Produto")
+    condicao = normalizar_condicao_externa(condition)
+    evidencias = " ".join(filter(None, [titulo, str(evidence_text or "")]))
+    detail = {
+        "condition": condicao,
+        "attributes": atributos_textuais(evidencias),
+    }
+    raw = {"condition": condicao}
+    match = avaliar_compatibilidade(spec, evidencias, raw, detail)
+    if not match.compatible:
+        return None, match
+    preco = decimal_seguro(price)
+    if preco is None or preco <= 0:
+        return None, MatchResult(False, 0, "no_price")
+    original = decimal_seguro(original_price)
+    if original is not None and original <= preco:
+        original = None
+    custo_frete = decimal_seguro(shipping_cost)
+    if free_shipping is True:
+        custo_frete = Decimal("0")
+    try:
+        qtd_avaliacoes = int(rating_count or 0)
+    except (TypeError, ValueError):
+        qtd_avaliacoes = 0
+    try:
+        qtd_vendidos = int(sold_count or 0)
+    except (TypeError, ValueError):
+        qtd_vendidos = 0
+    fonte = normalizar_fonte(source) or "universal"
+    cupom = coupon_from_raw(coupon_raw, fonte)
+    return (
+        Offer(
+            item_id=primeiro_texto(item_id, product_id),
+            product_id=primeiro_texto(product_id),
+            title=titulo,
+            config_label=spec.configuration_label(titulo),
+            price=preco,
+            original_price=original,
+            link=link_https(link),
+            seller_id=primeiro_texto(seller_id),
+            condition=condicao,
+            warranty=limitar_texto(warranty, 42),
+            free_shipping=free_shipping,
+            shipping_cost=custo_frete,
+            delivery_text="",
+            city=limitar_texto(city, 40),
+            state=limitar_texto(state, 24),
+            installments=None,
+            deal_ids=[],
+            confidence=match.confidence,
+            source=fonte,
+            source_label=SOURCE_LABELS.get(fonte, fonte.title()),
+            seller_name=limitar_texto(seller_name, 40),
+            seller_trusted=seller_trusted,
+            rating=decimal_seguro(rating),
+            rating_count=qtd_avaliacoes,
+            sold_count=qtd_vendidos,
+            coupon=cupom,
+            promotion_label=limitar_texto(promotion_label, 42),
+            trust_reason=trust_reason,
+            raw_metadata=raw_metadata or {},
+        ),
+        match,
+    )
+
+
+def contabilizar_match(stats: SearchStats, match: MatchResult) -> None:
+    if match.code == "accessory":
+        stats.rejected_accessory += 1
+    elif match.code == "conflict":
+        stats.rejected_conflict += 1
+    elif match.code == "unconfirmed":
+        stats.rejected_unconfirmed += 1
+    elif match.code == "no_price":
+        stats.rejected_no_price += 1
+
+
+def amazon_token_url() -> str:
+    if AMAZON_CREATORS_TOKEN_URL:
+        return AMAZON_CREATORS_TOKEN_URL
+    if AMAZON_CREATORS_CREDENTIAL_VERSION.startswith("2"):
+        return "https://creatorsapi.auth.us-east-1.amazoncognito.com/oauth2/token"
+    return "https://api.amazon.com/auth/o2/token"
+
+
+def obter_token_amazon() -> str:
+    agora = int(time.time())
+    if AMAZON_TOKEN_STATE.get("access_token") and int(
+        AMAZON_TOKEN_STATE.get("expires_at") or 0
+    ) > agora + 60:
+        return str(AMAZON_TOKEN_STATE["access_token"])
+    with AMAZON_TOKEN_LOCK:
+        if AMAZON_TOKEN_STATE.get("access_token") and int(
+            AMAZON_TOKEN_STATE.get("expires_at") or 0
+        ) > int(time.time()) + 60:
+            return str(AMAZON_TOKEN_STATE["access_token"])
+        payload = {
+            "grant_type": "client_credentials",
+            "client_id": AMAZON_CREATORS_CLIENT_ID,
+            "client_secret": AMAZON_CREATORS_CLIENT_SECRET,
+            "scope": (
+                "creatorsapi/default"
+                if AMAZON_CREATORS_CREDENTIAL_VERSION.startswith("2")
+                else "creatorsapi::default"
+            ),
+        }
+        try:
+            kwargs: dict[str, Any] = {
+                "headers": {"Accept": "application/json"},
+                "timeout": TIMEOUT,
+            }
+            if AMAZON_CREATORS_CREDENTIAL_VERSION.startswith("2"):
+                kwargs["data"] = payload
+                kwargs["headers"]["Content-Type"] = "application/x-www-form-urlencoded"
+            else:
+                kwargs["json"] = payload
+                kwargs["headers"]["Content-Type"] = "application/json"
+            resposta = requests.post(amazon_token_url(), **kwargs)
+            data = resposta.json()
+        except (requests.RequestException, ValueError):
+            logger.warning("Falha ao obter token Amazon Creators API", exc_info=True)
+            return ""
+        token = primeiro_texto(data.get("access_token")) if isinstance(data, dict) else ""
+        if not (200 <= resposta.status_code < 300 and token):
+            logger.info("Amazon recusou OAuth (HTTP %s)", resposta.status_code)
+            return ""
+        try:
+            expires = int(data.get("expires_in") or 3600)
+        except (TypeError, ValueError):
+            expires = 3600
+        AMAZON_TOKEN_STATE.update(
+            {"access_token": token, "expires_at": int(time.time()) + max(120, expires)}
+        )
+        return token
+
+
+def lista_amazon(payload: Any) -> list[dict[str, Any]]:
+    caminhos = [
+        ("searchResult", "items"),
+        ("SearchResult", "Items"),
+        ("items",),
+        ("results",),
+    ]
+    for caminho in caminhos:
+        atual: Any = payload
+        for chave in caminho:
+            atual = atual.get(chave) if isinstance(atual, dict) else None
+        if isinstance(atual, list):
+            return [item for item in atual if isinstance(item, dict)]
+    return []
+
+
+def buscar_amazon(termo: str, limite_resultados: int) -> SearchResult:
+    spec = parse_search_spec(termo)
+    stats = SearchStats(sources_queried=1)
+    token = obter_token_amazon()
+    if not token:
+        return SearchResult(False, 401, spec, [], stats, "amazon_auth")
+    recursos = [
+        "itemInfo.title",
+        "itemInfo.features",
+        "itemInfo.productInfo",
+        "itemInfo.technicalInfo",
+        "offersV2.listings.price",
+        "offersV2.listings.merchantInfo",
+        "offersV2.listings.condition",
+        "offersV2.listings.dealDetails",
+        "offersV2.listings.savingBasis",
+        "offersV2.listings.availability",
+    ]
+    payload = {
+        "keywords": spec.raw,
+        "marketplace": AMAZON_MARKETPLACE,
+        "partnerTag": AMAZON_PARTNER_TAG,
+        "itemCount": min(AMAZON_MAX_RESULTS, max(1, limite_resultados)),
+        "resources": recursos,
+    }
+    if spec.condition == "new":
+        payload["condition"] = "New"
+    elif spec.condition == "used":
+        payload["condition"] = "Used"
+    authorization = f"Bearer {token}"
+    if AMAZON_CREATORS_CREDENTIAL_VERSION.startswith("2"):
+        authorization += f", Version {AMAZON_CREATORS_CREDENTIAL_VERSION}"
+    try:
+        resposta = requests.post(
+            f"{AMAZON_CREATORS_API_URL}/catalog/v1/searchItems",
+            json=payload,
+            headers={
+                "Authorization": authorization,
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "x-marketplace": AMAZON_MARKETPLACE,
+            },
+            timeout=TIMEOUT,
+        )
+        data = resposta.json()
+    except (requests.RequestException, ValueError):
+        return SearchResult(False, None, spec, [], stats, "amazon_network")
+    if not 200 <= resposta.status_code < 300:
+        return SearchResult(False, resposta.status_code, spec, [], stats, "amazon_api")
+
+    itens = lista_amazon(data)
+    stats.raw_offers = len(itens)
+    stats.unique_items = len(itens)
+    ofertas: list[Offer] = []
+    for item in itens:
+        asin = primeiro_texto(item.get("asin"), item.get("ASIN"), item.get("id"))
+        titulo = primeiro_texto(
+            valor_caminho(item, "itemInfo", "title", "displayValue"),
+            valor_caminho(item, "ItemInfo", "Title", "DisplayValue"),
+            item.get("title"),
+        )
+        features = valor_caminho(item, "itemInfo", "features", "displayValues")
+        if not isinstance(features, list):
+            features = valor_caminho(item, "ItemInfo", "Features", "DisplayValues")
+        evidence = " ".join(str(v) for v in features) if isinstance(features, list) else ""
+        offers_v2 = item.get("offersV2") or item.get("OffersV2") or {}
+        listings = offers_v2.get("listings") or offers_v2.get("Listings") or []
+        if not isinstance(listings, list):
+            listings = []
+        if not listings:
+            listings = [item]
+        for indice, listing in enumerate(listings):
+            if not isinstance(listing, dict):
+                continue
+            price = (
+                valor_caminho(listing, "price", "amount")
+                or valor_caminho(listing, "Price", "Amount")
+                or valor_caminho(listing, "listingPrice", "amount")
+                or listing.get("price")
+            )
+            original = (
+                valor_caminho(listing, "savingBasis", "amount")
+                or valor_caminho(listing, "SavingBasis", "Amount")
+                or valor_caminho(listing, "regularPrice", "amount")
+            )
+            merchant = listing.get("merchantInfo") or listing.get("MerchantInfo") or {}
+            seller_name = primeiro_texto(
+                merchant.get("name") if isinstance(merchant, dict) else "",
+                merchant.get("Name") if isinstance(merchant, dict) else "",
+                listing.get("merchantName"),
+            )
+            vendido_amazon = "amazon" in normalizar_texto(seller_name)
+            trusted = vendido_amazon or AMAZON_ALLOW_MARKETPLACE_SELLERS
+            deal = listing.get("dealDetails") or listing.get("DealDetails") or {}
+            promotion = primeiro_texto(
+                deal.get("badge") if isinstance(deal, dict) else "",
+                deal.get("accessType") if isinstance(deal, dict) else "",
+                listing.get("promotionLabel"),
+            )
+            condition = primeiro_texto(
+                valor_caminho(listing, "condition", "displayValue"),
+                valor_caminho(listing, "condition", "value"),
+                valor_caminho(listing, "Condition", "DisplayValue"),
+                valor_caminho(listing, "Condition", "Value"),
+                "new",
+            )
+            oferta, match = criar_oferta_externa(
+                spec=spec,
+                source="amazon",
+                item_id=f"{asin}:{indice}" if len(listings) > 1 else asin,
+                product_id=asin,
+                title=titulo,
+                price=price,
+                original_price=original,
+                link=primeiro_texto(
+                    item.get("detailPageURL"), item.get("DetailPageURL"), item.get("url")
+                ),
+                seller_id=primeiro_texto(
+                    merchant.get("id") if isinstance(merchant, dict) else "",
+                    seller_name,
+                ),
+                seller_name=seller_name,
+                condition=condition,
+                free_shipping=None,
+                seller_trusted=trusted,
+                trust_reason=(
+                    "vendido pela Amazon"
+                    if vendido_amazon
+                    else "marketplace Amazon permitido"
+                    if trusted
+                    else "vendedor marketplace não verificado"
+                ),
+                evidence_text=evidence,
+                promotion_label=promotion,
+                raw_metadata=listing,
+            )
+            if oferta:
+                ofertas.append(oferta)
+            else:
+                contabilizar_match(stats, match)
+    stats.compatible = len(ofertas)
+    stats.sources_succeeded = 1
+    ofertas.sort(key=chave_ranking)
+    return SearchResult(
+        True, 200, spec, ofertas[:limite_resultados], stats, sources_used=["amazon"]
+    )
+
+
+def buscar_shopee(termo: str, limite_resultados: int) -> SearchResult:
+    spec = parse_search_spec(termo)
+    stats = SearchStats(sources_queried=1)
+    query = """query ProductOffers($keyword: String!, $sortType: Int!, $page: Int!, $limit: Int!) {
+  productOfferV2(keyword: $keyword, sortType: $sortType, page: $page, limit: $limit) {
+    nodes { productId productName productLink offerLink imageUrl price priceMin priceMax shopId shopName ratingStar soldCount commissionRate periodStartTime periodEndTime }
+  }
+}"""
+    payload = {
+        "query": query,
+        "variables": {
+            "keyword": spec.raw,
+            "sortType": 2,
+            "page": 1,
+            "limit": min(SHOPEE_MAX_RESULTS, max(1, limite_resultados * 2)),
+        },
+    }
+    corpo = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    timestamp = str(int(time.time()))
+    assinatura = hashlib.sha256(
+        f"{SHOPEE_AFFILIATE_APP_ID}{timestamp}{corpo}{SHOPEE_AFFILIATE_APP_SECRET}".encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    try:
+        resposta = requests.post(
+            SHOPEE_AFFILIATE_API_URL,
+            data=corpo.encode("utf-8"),
+            headers={
+                "Authorization": (
+                    f"SHA256 Credential={SHOPEE_AFFILIATE_APP_ID}, "
+                    f"Timestamp={timestamp}, Signature={assinatura}"
+                ),
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            timeout=TIMEOUT,
+        )
+        data = resposta.json()
+    except (requests.RequestException, ValueError):
+        return SearchResult(False, None, spec, [], stats, "shopee_network")
+    if not 200 <= resposta.status_code < 300 or not isinstance(data, dict):
+        return SearchResult(False, resposta.status_code, spec, [], stats, "shopee_api")
+    if data.get("errors"):
+        return SearchResult(False, resposta.status_code, spec, [], stats, "shopee_graphql")
+    bloco = valor_caminho(data, "data", "productOfferV2") or {}
+    nodes = bloco.get("nodes") or bloco.get("items") or bloco.get("products") or []
+    if not isinstance(nodes, list):
+        nodes = []
+    stats.raw_offers = len(nodes)
+    stats.unique_items = len(nodes)
+    ofertas: list[Offer] = []
+    for raw in nodes:
+        if not isinstance(raw, dict):
+            continue
+        centavos = decimal_seguro(raw.get("priceMin") or raw.get("price") or raw.get("priceMax"))
+        preco = centavos / 100 if centavos is not None else None
+        rating = decimal_seguro(raw.get("ratingStar"))
+        try:
+            sold = int(raw.get("soldCount") or 0)
+        except (TypeError, ValueError):
+            sold = 0
+        trusted = bool(
+            rating is not None
+            and rating >= Decimal(str(SHOPEE_MIN_RATING))
+            and sold >= SHOPEE_MIN_SOLD
+        )
+        oferta, match = criar_oferta_externa(
+            spec=spec,
+            source="shopee",
+            item_id=raw.get("productId"),
+            product_id=raw.get("productId"),
+            title=raw.get("productName"),
+            price=preco,
+            link=primeiro_texto(raw.get("offerLink"), raw.get("productLink")),
+            seller_id=raw.get("shopId"),
+            seller_name=raw.get("shopName"),
+            condition="new",
+            rating=rating,
+            sold_count=sold,
+            seller_trusted=trusted,
+            trust_reason=(
+                f"nota {rating} e {sold} vendas"
+                if trusted
+                else "nota ou volume de vendas abaixo do mínimo"
+            ),
+            raw_metadata=raw,
+        )
+        if oferta:
+            ofertas.append(oferta)
+        else:
+            contabilizar_match(stats, match)
+    stats.compatible = len(ofertas)
+    stats.sources_succeeded = 1
+    ofertas.sort(key=chave_ranking)
+    return SearchResult(
+        True, 200, spec, ofertas[:limite_resultados], stats, sources_used=["shopee"]
+    )
+
+
+def buscar_olx(termo: str, limite_resultados: int) -> SearchResult:
+    spec = parse_search_spec(termo)
+    stats = SearchStats(sources_queried=1)
+    payload: dict[str, Any] = {
+        "target": "olx.com.br",
+        "type": "plp",
+        "keyword": spec.raw,
+        "sort": "price",
+        "page": 1,
+    }
+    if GECKO_OLX_STATE:
+        payload["state"] = GECKO_OLX_STATE
+    try:
+        resposta = requests.post(
+            GECKO_API_URL,
+            json=payload,
+            headers={"Authorization": f"Bearer {GECKO_API_KEY}", "Accept": "application/json"},
+            timeout=TIMEOUT,
+        )
+        data = resposta.json()
+    except (requests.RequestException, ValueError):
+        return SearchResult(False, None, spec, [], stats, "olx_connector_network")
+    if not 200 <= resposta.status_code < 300 or not isinstance(data, dict):
+        return SearchResult(False, resposta.status_code, spec, [], stats, "olx_connector_api")
+    items = valor_caminho(data, "data", "items") or data.get("items") or []
+    if not isinstance(items, list):
+        items = []
+    items = [item for item in items[:GECKO_MAX_RESULTS] if isinstance(item, dict)]
+    stats.raw_offers = len(items)
+    stats.unique_items = len(items)
+    ofertas: list[Offer] = []
+    for raw in items:
+        location = raw.get("location") if isinstance(raw.get("location"), dict) else {}
+        propriedades = raw.get("properties")
+        if isinstance(propriedades, dict):
+            evidence = " ".join(f"{k} {v}" for k, v in propriedades.items())
+        elif isinstance(propriedades, list):
+            evidence = " ".join(str(v) for v in propriedades)
+        else:
+            evidence = ""
+        professional = bool_seguro(raw.get("professionalAd"))
+        pay_delivery = bool(
+            bool_seguro(raw.get("olxPayEnabled"))
+            and bool_seguro(raw.get("olxDeliveryEnabled"))
+        )
+        trusted = bool(OLX_ALLOW_AUTOMATIC_ALERTS and professional and pay_delivery)
+        oferta, match = criar_oferta_externa(
+            spec=spec,
+            source="olx",
+            item_id=raw.get("id"),
+            product_id=raw.get("id"),
+            title=raw.get("title"),
+            price=raw.get("price"),
+            original_price=raw.get("oldPrice"),
+            link=raw.get("url"),
+            seller_id=raw.get("sellerId"),
+            seller_name=raw.get("sellerName"),
+            condition=raw.get("condition"),
+            city=location.get("city"),
+            state=location.get("state"),
+            seller_trusted=trusted,
+            trust_reason=(
+                "anúncio profissional com pagamento e entrega OLX"
+                if trusted
+                else "identidade/reputação não confirmada para alerta"
+            ),
+            evidence_text=evidence,
+            raw_metadata=raw,
+        )
+        if oferta:
+            ofertas.append(oferta)
+        else:
+            contabilizar_match(stats, match)
+    stats.compatible = len(ofertas)
+    stats.sources_succeeded = 1
+    ofertas.sort(key=chave_ranking)
+    return SearchResult(True, 200, spec, ofertas[:limite_resultados], stats, sources_used=["olx"])
+
+
+def buscar_gecko_loja(
+    termo: str, limite_resultados: int, source: str
+) -> SearchResult:
+    """Fallback estruturado para Amazon/Shopee, sem scraping dentro do bot."""
+    spec = parse_search_spec(termo)
+    stats = SearchStats(sources_queried=1)
+    targets = {"amazon": "amazon.com.br", "shopee": "shopee.com.br"}
+    target = targets.get(source)
+    if not target:
+        return SearchResult(False, None, spec, [], stats, "unsupported_connector")
+    try:
+        resposta = requests.post(
+            GECKO_API_URL,
+            json={
+                "target": target,
+                "type": "plp",
+                "keyword": spec.raw,
+                "sort": "price",
+                "page": 1,
+            },
+            headers={"Authorization": f"Bearer {GECKO_API_KEY}", "Accept": "application/json"},
+            timeout=TIMEOUT,
+        )
+        data = resposta.json()
+    except (requests.RequestException, ValueError):
+        return SearchResult(False, None, spec, [], stats, f"{source}_connector_network")
+    if not 200 <= resposta.status_code < 300 or not isinstance(data, dict):
+        return SearchResult(
+            False, resposta.status_code, spec, [], stats, f"{source}_connector_api"
+        )
+    items = valor_caminho(data, "data", "items") or data.get("items") or []
+    if not isinstance(items, list):
+        items = []
+    items = [item for item in items[:GECKO_MAX_RESULTS] if isinstance(item, dict)]
+    stats.raw_offers = len(items)
+    stats.unique_items = len(items)
+    ofertas: list[Offer] = []
+    for raw in items:
+        seller = raw.get("seller") if isinstance(raw.get("seller"), dict) else {}
+        rating = decimal_seguro(
+            raw.get("rating") or raw.get("ratingStar") or seller.get("rating")
+        )
+        sold_raw = raw.get("soldCount") or raw.get("sold") or seller.get("soldCount") or 0
+        try:
+            sold = int(sold_raw)
+        except (TypeError, ValueError):
+            sold = 0
+        seller_name = primeiro_texto(
+            raw.get("sellerName"), raw.get("shopName"), seller.get("name")
+        )
+        if source == "amazon":
+            trusted = bool(
+                bool_seguro(raw.get("isAmazon"))
+                or "amazon" in normalizar_texto(seller_name)
+            )
+            if AMAZON_ALLOW_MARKETPLACE_SELLERS:
+                trusted = True
+        else:
+            trusted = bool(
+                rating is not None
+                and rating >= Decimal(str(SHOPEE_MIN_RATING))
+                and sold >= SHOPEE_MIN_SOLD
+            )
+        props = raw.get("properties") or raw.get("features") or raw.get("description") or ""
+        if isinstance(props, dict):
+            evidence = " ".join(f"{k} {v}" for k, v in props.items())
+        elif isinstance(props, list):
+            evidence = " ".join(str(v) for v in props)
+        else:
+            evidence = str(props)
+        oferta, match = criar_oferta_externa(
+            spec=spec,
+            source=source,
+            item_id=primeiro_texto(raw.get("id"), raw.get("asin"), raw.get("productId")),
+            product_id=primeiro_texto(raw.get("asin"), raw.get("productId"), raw.get("id")),
+            title=primeiro_texto(raw.get("title"), raw.get("name"), raw.get("productName")),
+            price=primeiro_texto(
+                raw.get("price"), raw.get("priceMin"), valor_caminho(raw, "buyBox", "price")
+            ),
+            original_price=primeiro_texto(
+                raw.get("oldPrice"), raw.get("originalPrice"), raw.get("listPrice")
+            ),
+            link=primeiro_texto(
+                raw.get("url"), raw.get("productLink"), raw.get("offerLink")
+            ),
+            seller_id=primeiro_texto(raw.get("sellerId"), raw.get("shopId"), seller.get("id")),
+            seller_name=seller_name,
+            condition=raw.get("condition") or "new",
+            warranty=raw.get("warranty"),
+            free_shipping=raw.get("freeShipping"),
+            rating=rating,
+            sold_count=sold,
+            seller_trusted=trusted,
+            trust_reason=(
+                "vendedor confirmado pelo critério da fonte"
+                if trusted
+                else "vendedor não confirmado pelo conector"
+            ),
+            evidence_text=evidence,
+            promotion_label=primeiro_texto(raw.get("deal"), raw.get("promotion")),
+            coupon_raw=raw.get("coupon"),
+            raw_metadata=raw,
+        )
+        if oferta:
+            ofertas.append(oferta)
+        else:
+            contabilizar_match(stats, match)
+    stats.compatible = len(ofertas)
+    stats.sources_succeeded = 1
+    ofertas.sort(key=chave_ranking)
+    return SearchResult(
+        True, 200, spec, ofertas[:limite_resultados], stats, sources_used=[source]
+    )
+
+
+def buscar_amazon_integrado(termo: str, limite_resultados: int) -> SearchResult:
+    oficial = bool(
+        AMAZON_CREATORS_CLIENT_ID
+        and AMAZON_CREATORS_CLIENT_SECRET
+        and AMAZON_PARTNER_TAG
+    )
+    if oficial:
+        resultado = buscar_amazon(termo, limite_resultados)
+        if resultado.ok or not GECKO_API_KEY:
+            return resultado
+        logger.info("Amazon oficial indisponível; usando conector de fallback")
+    return buscar_gecko_loja(termo, limite_resultados, "amazon")
+
+
+def buscar_shopee_integrado(termo: str, limite_resultados: int) -> SearchResult:
+    oficial = bool(SHOPEE_AFFILIATE_APP_ID and SHOPEE_AFFILIATE_APP_SECRET)
+    if oficial:
+        resultado = buscar_shopee(termo, limite_resultados)
+        if resultado.ok or not GECKO_API_KEY:
+            return resultado
+        logger.info("Shopee oficial indisponível; usando conector de fallback")
+    return buscar_gecko_loja(termo, limite_resultados, "shopee")
+
+
+def lista_universal(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        return [v for v in payload if isinstance(v, dict)]
+    if not isinstance(payload, dict):
+        return []
+    for chave in ("results", "items", "offers", "products"):
+        valor = payload.get(chave)
+        if isinstance(valor, list):
+            return [v for v in valor if isinstance(v, dict)]
+    return []
+
+
+def buscar_universal(
+    termo: str, limite_resultados: int, fontes: Optional[set[str]] = None
+) -> SearchResult:
+    spec = parse_search_spec(termo)
+    stats = SearchStats(sources_queried=1)
+    headers = {"Accept": "application/json"}
+    if UNIVERSAL_SEARCH_API_KEY:
+        headers["Authorization"] = f"Bearer {UNIVERSAL_SEARCH_API_KEY}"
+    params: dict[str, Any] = {
+        "q": spec.raw,
+        "limit": min(UNIVERSAL_MAX_RESULTS, max(1, limite_resultados * 4)),
+    }
+    if fontes:
+        params["sources"] = ",".join(sorted(fontes))
+    try:
+        resposta = HTTP.get(
+            UNIVERSAL_SEARCH_URL, params=params, headers=headers, timeout=TIMEOUT
+        )
+        data = resposta.json()
+    except (requests.RequestException, ValueError):
+        return SearchResult(False, None, spec, [], stats, "universal_network")
+    if not 200 <= resposta.status_code < 300:
+        return SearchResult(False, resposta.status_code, spec, [], stats, "universal_api")
+    items = lista_universal(data)
+    stats.raw_offers = len(items)
+    stats.unique_items = len(items)
+    ofertas: list[Offer] = []
+    sources_used: list[str] = []
+    for raw in items:
+        fonte = normalizar_fonte(raw.get("source") or raw.get("store") or "universal")
+        if fontes and fonte not in fontes and "universal" not in fontes:
+            continue
+        vendedor = raw.get("seller") if isinstance(raw.get("seller"), dict) else {}
+        frete = raw.get("shipping") if isinstance(raw.get("shipping"), dict) else {}
+        local = raw.get("location") if isinstance(raw.get("location"), dict) else {}
+        trusted_flag = raw.get("trusted")
+        trusted = (
+            bool_seguro(trusted_flag)
+            if trusted_flag is not None
+            else fonte in UNIVERSAL_TRUSTED_SOURCES
+        )
+        descricao = primeiro_texto(raw.get("description"), raw.get("attributes_text"))
+        oferta, match = criar_oferta_externa(
+            spec=spec,
+            source=fonte,
+            item_id=primeiro_texto(raw.get("id"), raw.get("item_id")),
+            product_id=primeiro_texto(raw.get("product_id"), raw.get("sku")),
+            title=primeiro_texto(raw.get("title"), raw.get("name")),
+            price=raw.get("price"),
+            original_price=raw.get("original_price"),
+            link=primeiro_texto(raw.get("url"), raw.get("link")),
+            seller_id=primeiro_texto(vendedor.get("id"), raw.get("seller_id")),
+            seller_name=primeiro_texto(vendedor.get("name"), raw.get("seller_name")),
+            condition=raw.get("condition") or "new",
+            warranty=raw.get("warranty"),
+            free_shipping=(
+                bool_seguro(frete.get("free"))
+                if frete.get("free") is not None
+                else (
+                    bool_seguro(raw.get("free_shipping"))
+                    if raw.get("free_shipping") is not None
+                    else None
+                )
+            ),
+            shipping_cost=frete.get("cost") or raw.get("shipping_cost"),
+            city=primeiro_texto(local.get("city"), raw.get("city")),
+            state=primeiro_texto(local.get("state"), raw.get("state")),
+            rating=primeiro_texto(vendedor.get("rating"), raw.get("rating")),
+            rating_count=primeiro_texto(vendedor.get("rating_count"), raw.get("rating_count"), 0),
+            sold_count=primeiro_texto(vendedor.get("sold_count"), raw.get("sold_count"), 0),
+            seller_trusted=trusted,
+            trust_reason=primeiro_texto(raw.get("trust_reason"), "conector não marcou como confiável"),
+            evidence_text=descricao,
+            promotion_label=primeiro_texto(raw.get("promotion"), raw.get("promotion_label")),
+            coupon_raw=raw.get("coupon"),
+            raw_metadata=raw,
+        )
+        if oferta:
+            ofertas.append(oferta)
+            sources_used.append(fonte)
+        else:
+            contabilizar_match(stats, match)
+    stats.compatible = len(ofertas)
+    stats.sources_succeeded = 1
+    ofertas.sort(key=chave_ranking)
+    return SearchResult(
+        True,
+        200,
+        spec,
+        ofertas[:limite_resultados],
+        stats,
+        sources_used=lista_unica(sources_used),
+    )
+
+
+def fontes_configuradas() -> dict[str, bool]:
+    return {
+        "mercadolivre": bool("mercadolivre" in ENABLED_SOURCES and TOKENS.conectado()),
+        "amazon": bool(
+            "amazon" in ENABLED_SOURCES
+            and (
+                (
+                    AMAZON_CREATORS_CLIENT_ID
+                    and AMAZON_CREATORS_CLIENT_SECRET
+                    and AMAZON_PARTNER_TAG
+                )
+                or GECKO_API_KEY
+            )
+        ),
+        "shopee": bool(
+            "shopee" in ENABLED_SOURCES
+            and (
+                (SHOPEE_AFFILIATE_APP_ID and SHOPEE_AFFILIATE_APP_SECRET)
+                or GECKO_API_KEY
+            )
+        ),
+        "olx": bool("olx" in ENABLED_SOURCES and GECKO_API_KEY),
+        "buscape": bool("buscape" in ENABLED_SOURCES and UNIVERSAL_SEARCH_URL),
+        "universal": bool("universal" in ENABLED_SOURCES and UNIVERSAL_SEARCH_URL),
+    }
+
+
+def separar_fonte_busca(termo: str) -> tuple[str, Optional[set[str]]]:
+    texto = " ".join(str(termo or "").split())
+    match = re.match(r"^([^:]{1,24})\s*:\s*(.+)$", texto)
+    if not match:
+        return texto, None
+    prefixo = normalizar_fonte(match.group(1))
+    if prefixo in {"todos", "all"}:
+        return match.group(2).strip(), None
+    if prefixo in set(SOURCE_LABELS):
+        return match.group(2).strip(), {prefixo}
+    return texto, None
+
+
+def links_comparacao(termo: str) -> dict[str, str]:
+    q = urlencode({"q": termo})
+    keyword = urlencode({"keyword": termo})
+    return {
+        "Amazon": f"https://www.amazon.com.br/s?{urlencode({'k': termo})}",
+        "Shopee": f"https://shopee.com.br/search?{keyword}",
+        "OLX": f"https://www.olx.com.br/brasil?{q}",
+        "Buscapé": f"https://www.buscape.com.br/search?{q}",
+    }
+
+
+def somar_stats(destino: SearchStats, origem: SearchStats) -> None:
+    for campo in (
+        "products_received", "products_selected", "raw_offers", "unique_items",
+        "rejected_accessory", "rejected_conflict", "rejected_unconfirmed",
+        "rejected_no_price", "compatible", "sources_queried", "sources_succeeded",
+    ):
+        setattr(destino, campo, getattr(destino, campo) + getattr(origem, campo))
+
+
+def buscar_ofertas_completas(
+    termo: str, limite_resultados: int = MAX_RESULTS
+) -> SearchResult:
+    limite_resultados = max(1, min(int(limite_resultados), MAX_OFFERS_TO_ENRICH))
+    consulta, selecionadas = separar_fonte_busca(termo)
+    spec = parse_search_spec(consulta)
+    configuradas = fontes_configuradas()
+    if selecionadas is None:
+        fontes = {fonte for fonte, pronta in configuradas.items() if pronta}
+    else:
+        fontes = {fonte for fonte in selecionadas if configuradas.get(fonte, False)}
+    if not fontes:
+        solicitadas = selecionadas or set(configuradas)
+        faltantes = ", ".join(SOURCE_LABELS.get(f, f) for f in sorted(solicitadas))
+        return SearchResult(
+            False,
+            None,
+            spec,
+            [],
+            SearchStats(),
+            "no_sources_configured" + (f":{faltantes}" if faltantes else ""),
+            comparison_links=links_comparacao(consulta),
+        )
+
+    tarefas: dict[str, Any] = {}
+    universal_fontes = {f for f in fontes if f in {"buscape", "universal"}}
+    if "mercadolivre" in fontes:
+        tarefas["mercadolivre"] = lambda: buscar_mercado_livre(
+            consulta, limite_resultados
+        )
+    if "amazon" in fontes:
+        tarefas["amazon"] = lambda: buscar_amazon_integrado(
+            consulta, limite_resultados
+        )
+    if "shopee" in fontes:
+        tarefas["shopee"] = lambda: buscar_shopee_integrado(
+            consulta, limite_resultados
+        )
+    if "olx" in fontes:
+        tarefas["olx"] = lambda: buscar_olx(consulta, limite_resultados)
+    if universal_fontes:
+        tarefas["universal"] = lambda: buscar_universal(
+            consulta,
+            limite_resultados,
+            None if "universal" in universal_fontes else universal_fontes,
+        )
+
+    resultados: dict[str, SearchResult] = {}
+    with ThreadPoolExecutor(max_workers=min(5, len(tarefas))) as pool:
+        futuros = {fonte: pool.submit(funcao) for fonte, funcao in tarefas.items()}
+        for fonte, futuro in futuros.items():
+            try:
+                resultados[fonte] = futuro.result()
+            except Exception:
+                logger.exception("Falha inesperada no conector %s", fonte)
+                resultados[fonte] = SearchResult(
+                    False, None, spec, [], SearchStats(sources_queried=1), "unexpected"
+                )
+
+    stats = SearchStats()
+    ofertas: list[Offer] = []
+    errors: dict[str, str] = {}
+    sources_used: list[str] = []
+    algum_sucesso = False
+    for fonte, resultado in resultados.items():
+        somar_stats(stats, resultado.stats)
+        if resultado.ok:
+            algum_sucesso = True
+            ofertas.extend(resultado.offers)
+            sources_used.extend(resultado.sources_used or [fonte])
+        else:
+            errors[fonte] = resultado.error or f"http_{resultado.status}"
+
+    feeds = carregar_cupons_feed() if (COUPONS_JSON or COUPON_FEED_URLS) else []
+    for oferta in ofertas:
+        anexar_melhor_cupom(oferta, consulta, feeds)
+    unicas: dict[tuple[str, str], Offer] = {}
+    for oferta in ofertas:
+        chave = (oferta.source, oferta.item_id or oferta.link)
+        atual = unicas.get(chave)
+        if atual is None or oferta.price < atual.price:
+            unicas[chave] = oferta
+    ofertas = list(unicas.values())
+    ofertas.sort(key=chave_ranking)
+    stats.compatible = len(ofertas)
+    return SearchResult(
+        algum_sucesso,
+        200 if algum_sucesso else None,
+        spec,
+        ofertas[:limite_resultados],
+        stats,
+        "" if algum_sucesso else "all_sources_failed",
+        sources_used=lista_unica(sources_used),
+        provider_errors=errors,
+        comparison_links=links_comparacao(consulta),
+    )
 
 
 # =============================================================================
@@ -2273,19 +3784,24 @@ def garantia_insegura(garantia: str) -> bool:
 
 
 def oferta_elegivel_alerta(oferta: Offer) -> bool:
-    return bool(
+    base = bool(
         oferta.item_id
         and oferta.link
         and oferta.condition == "new"
-        and reputation_level(oferta) in SAFE_REPUTATION_LEVELS
         and not garantia_insegura(oferta.warranty)
+        and oferta.price_confirmed
     )
+    if not base:
+        return False
+    if oferta.source == "mercadolivre":
+        return reputation_level(oferta) in SAFE_REPUTATION_LEVELS
+    return oferta.seller_trusted is True
 
 
 def formatar_vendedor(oferta: Offer) -> str:
     seller = oferta.seller if isinstance(oferta.seller, dict) else {}
     seller_id = oferta.seller_id
-    nickname = limitar_texto(seller.get("nickname"), 25)
+    nickname = limitar_texto(oferta.seller_name or seller.get("nickname"), 25)
     identificacao = nickname or (f"Seller {seller_id}" if seller_id else "Vendedor")
     reputacao = seller.get("seller_reputation") if isinstance(seller.get("seller_reputation"), dict) else {}
     level = primeiro_texto(reputacao.get("level_id"))
@@ -2298,6 +3814,11 @@ def formatar_vendedor(oferta: Offer) -> str:
         partes.append(f"{emoji} {label}")
     elif seller_id and not nickname:
         partes[0] = f"Seller {seller_id}"
+    if oferta.source != "mercadolivre":
+        if oferta.rating is not None:
+            partes.append(f"⭐ {str(oferta.rating).replace('.', ',')}")
+        if oferta.sold_count:
+            partes.append(f"{oferta.sold_count} vendas")
     return " • ".join(partes)
 
 
@@ -2325,7 +3846,10 @@ def formatar_frete_garantia(oferta: Offer) -> str:
 
 def montar_card(oferta: Offer, posicao: int) -> str:
     marcador = MEDALHAS.get(posicao, f"#{posicao}")
-    linhas = [f"<b>{marcador} {html.escape(brl(oferta.price))}</b>"]
+    linhas = [
+        f"<b>{marcador} {html.escape(brl(oferta.price))}</b> "
+        f"• {html.escape(oferta.source_label)}"
+    ]
     linhas.append(html.escape(limitar_texto(oferta.config_label, 92)))
 
     if oferta.original_price:
@@ -2343,6 +3867,39 @@ def montar_card(oferta: Offer, posicao: int) -> str:
             )
         )
 
+    if oferta.promotion_label:
+        linhas.append(
+            "🏷 " + html.escape(f"Promoção pública: {oferta.promotion_label}")
+        )
+
+    if oferta.coupon:
+        desconto = oferta.coupon.discount_for(oferta.price)
+        estimado = oferta.estimated_coupon_price
+        descricao: list[str] = []
+        if oferta.coupon.discount_type == "percent" and oferta.coupon.value is not None:
+            descricao.append(f"{format(oferta.coupon.value, 'f')}% OFF")
+        elif desconto is not None:
+            descricao.append(f"{brl(desconto)} OFF")
+        if oferta.coupon.max_discount is not None:
+            descricao.append(f"até {brl(oferta.coupon.max_discount)}")
+        if oferta.coupon.min_purchase is not None:
+            descricao.append(f"mín. {brl(oferta.coupon.min_purchase)}")
+        if oferta.coupon.code:
+            descricao.append(f"código {oferta.coupon.code}")
+        if not descricao and oferta.coupon.label:
+            descricao.append(oferta.coupon.label)
+        linhas.append("🎟 " + html.escape(" • ".join(descricao)))
+        if estimado is not None:
+            linhas.append(
+                f"💡 Estimado com cupom: <b>{html.escape(brl(estimado))}</b>"
+            )
+        if not oferta.coupon.terms_verified:
+            linhas.append("⚠️ <i>Regras do cupom ainda não verificadas</i>")
+        elif oferta.coupon.buyer_specific:
+            linhas.append("⚠️ <i>Cupom segmentado para contas elegíveis</i>")
+        else:
+            linhas.append("⚠️ <i>Cupom sujeito à validação no carrinho</i>")
+
     linhas.append(html.escape(formatar_frete_garantia(oferta)))
 
     local = ", ".join(filter(None, [oferta.city, oferta.state]))
@@ -2353,18 +3910,23 @@ def montar_card(oferta: Offer, posicao: int) -> str:
     linhas.append(html.escape(linha_vendedor))
 
     level = reputation_level(oferta)
-    if level in {"1_red", "2_orange"}:
+    if oferta.source == "mercadolivre" and level in {"1_red", "2_orange"}:
         linhas.append("⚠️ <b>Alto risco — não elegível para alerta automático</b>")
-    elif level == "3_yellow":
+    elif oferta.source == "mercadolivre" and level == "3_yellow":
         linhas.append("⚠️ Reputação intermediária — alerta automático bloqueado")
-    elif not level:
+    elif oferta.source == "mercadolivre" and not level:
         linhas.append("⚠️ Reputação não confirmada — alerta automático bloqueado")
+    elif oferta.source != "mercadolivre" and oferta.seller_trusted is not True:
+        motivo = oferta.trust_reason or "vendedor não confirmado"
+        linhas.append(
+            "⚠️ " + html.escape(f"{motivo} — alerta automático bloqueado")
+        )
     elif garantia_insegura(oferta.warranty):
         linhas.append("⚠️ Sem garantia declarada — alerta automático bloqueado")
     elif oferta.condition != "new":
         linhas.append("⚠️ Item não novo — alerta automático bloqueado")
 
-    if oferta.deal_ids:
+    if oferta.deal_ids and not oferta.promotion_label:
         linhas.append("🏷 Promoção detectada no anúncio")
 
     if oferta.link:
@@ -2383,13 +3945,27 @@ def resumo_resultados(resultado: SearchResult) -> str:
         else "menor preço primeiro"
     )
     rotulo = "oferta compatível" if quantidade == 1 else "ofertas compatíveis"
+    fontes = ", ".join(
+        SOURCE_LABELS.get(fonte, fonte.title()) for fonte in resultado.sources_used
+    )
     cabecalho = f"✅ <b>{quantidade} {rotulo}</b> • {criterio}"
+    if fontes:
+        cabecalho += f"\n🏪 {html.escape(fontes)}"
     blocos = [cabecalho]
+    if resultado.provider_errors:
+        indisponiveis = ", ".join(
+            SOURCE_LABELS.get(fonte, fonte.title())
+            for fonte in resultado.provider_errors
+        )
+        blocos.append(
+            "⚠️ Fonte(s) temporariamente indisponível(is): "
+            + html.escape(indisponiveis)
+        )
     for indice, oferta in enumerate(ofertas, start=1):
         blocos.append(montar_card(oferta, indice))
     blocos.append(
-        "<i>Preços anteriores são os valores informados pelos anúncios. "
-        "Cupom, parcela e frete podem variar por conta e CEP; o bot só exibe o que a API confirmou.</i>"
+        "<i>Preço principal = valor confirmado pela fonte. Preço com cupom = estimativa; "
+        "conta, estoque, pagamento, CEP, limite e carrinho podem alterar a aplicação.</i>"
     )
     texto = "\n\n".join(blocos)
     # Mantém margem abaixo do limite de 4096 caracteres do Telegram.
@@ -2568,12 +4144,17 @@ def executar_busca(
             chat_id,
             "🔎 <b>GARIMPANDO…</b>\n\n"
             f"Validando <b>{html.escape(spec.configuration_label(spec.raw))}</b>\n"
-            "Configuração → preço → vendedor → link",
+            "Configuração → lojas → preço → cupom → vendedor → link",
             message_thread_id=message_thread_id,
         )
         resultado = buscar_ofertas_completas(termo)
         if not resultado.ok:
-            if resultado.status == 401 or resultado.error == "not_authenticated":
+            if resultado.error.startswith("no_sources_configured"):
+                texto = (
+                    "⚠️ <b>A fonte solicitada ainda não está configurada.</b>\n\n"
+                    "Use /status para ver as integrações prontas."
+                )
+            elif resultado.status == 401 or resultado.error == "not_authenticated":
                 texto = (
                     "⚠️ <b>Mercado Livre não autorizado</b>\n\n"
                     f'<a href="{html.escape(APP_BASE_URL)}/oauth/login">Conectar novamente</a>'
@@ -2696,6 +4277,7 @@ def montar_alerta_promocao(
         "",
         f"<b>{html.escape(brl(oferta.price))}</b>",
         html.escape(limitar_texto(oferta.config_label, 100)),
+        f"🏪 {html.escape(oferta.source_label)}",
     ]
     target = centavos_para_decimal(monitor.get("target_price_cents"))
     if target is not None:
@@ -2727,6 +4309,59 @@ def montar_alerta_promocao(
     return "\n".join(linhas)
 
 
+def montar_alerta_cupom(
+    monitor: dict[str, Any], oferta: Offer, confirmations: int
+) -> str:
+    cupom = oferta.coupon
+    estimado = oferta.estimated_coupon_price
+    if cupom is None or estimado is None:
+        return ""
+    desconto = cupom.discount_for(oferta.price) or Decimal("0")
+    linhas = [
+        "🎟 <b>CUPOM FORTE DETECTADO</b>",
+        "",
+        html.escape(limitar_texto(oferta.config_label, 100)),
+        f"🏪 {html.escape(oferta.source_label)}",
+        f"Preço confirmado: <b>{html.escape(brl(oferta.price))}</b>",
+        f"Estimativa com cupom: <b>{html.escape(brl(estimado))}</b>",
+        f"Economia estimada: {html.escape(brl(desconto))}",
+    ]
+    detalhes: list[str] = []
+    if cupom.discount_type == "percent" and cupom.value is not None:
+        detalhes.append(f"{format(cupom.value, 'f')}% OFF")
+    if cupom.max_discount is not None:
+        detalhes.append(f"limite {brl(cupom.max_discount)}")
+    if cupom.min_purchase is not None:
+        detalhes.append(f"compra mínima {brl(cupom.min_purchase)}")
+    if cupom.code:
+        detalhes.append(f"código {cupom.code}")
+    elif cupom.label:
+        detalhes.append(cupom.label)
+    if detalhes:
+        linhas.append("🏷 " + html.escape(" • ".join(detalhes)))
+    target = centavos_para_decimal(monitor.get("target_price_cents"))
+    if target is not None:
+        atingiu = "atinge" if estimado <= target else "ainda não atinge"
+        linhas.append(
+            f"🎯 {html.escape(atingiu)} o alvo de {html.escape(brl(target))}"
+        )
+    linhas.append(f"✅ Encontrado em {confirmations} verificações consecutivas")
+    linhas.append("🟢 Vendedor elegível para alerta automático")
+    if oferta.link:
+        linhas.append(
+            f'🔗 <a href="{html.escape(oferta.link, quote=True)}">Abrir anúncio</a>'
+        )
+    if cupom.url:
+        linhas.append(
+            f'📄 <a href="{html.escape(cupom.url, quote=True)}">Ver regras do cupom</a>'
+        )
+    linhas.append(
+        "\n⚠️ <b>Valide no carrinho.</b> O cupom pode depender da conta, estoque, "
+        "pagamento, CEP, limite de usos e produtos participantes."
+    )
+    return "\n".join(linhas)
+
+
 def processar_monitor(
     monitor: dict[str, Any], resultado: Optional[SearchResult] = None
 ) -> str:
@@ -2753,25 +4388,55 @@ def processar_monitor(
         return "no_safe_offer"
 
     elegiveis.sort(key=lambda oferta: oferta.price)
-    melhor = elegiveis[0]
-    current_cents = decimal_para_centavos(melhor.price)
+    melhor_confirmado = elegiveis[0]
+    confirmed_cents = decimal_para_centavos(melhor_confirmado.price)
     target_cents = monitor.get("target_price_cents")
-    target_hit = target_cents is not None and current_cents <= int(target_cents)
+    target_hit = target_cents is not None and confirmed_cents <= int(target_cents)
 
     history_hit = False
     if baseline_cents and history_checks >= MONITOR_MIN_HISTORY_CHECKS:
         percentual = Decimal("1") - Decimal(str(ALERT_DROP_PERCENT)) / 100
         limite = int(Decimal(baseline_cents) * percentual)
-        queda_absoluta = baseline_cents - current_cents
+        queda_absoluta = baseline_cents - confirmed_cents
         history_hit = bool(
-            current_cents <= limite
+            confirmed_cents <= limite
             and queda_absoluta >= int(ALERT_MIN_DROP_REAIS * 100)
         )
 
-    promocao = target_hit or history_hit
-    if not promocao:
+    tipo_sinal = ""
+    melhor = melhor_confirmado
+    signal_price = melhor.price
+    signal_id = f"confirmed:{melhor.signal_id}"
+    if target_hit or history_hit:
+        tipo_sinal = "confirmed"
+    elif COUPON_ALERTS_ENABLED:
+        cupons = [
+            oferta
+            for oferta in elegiveis
+            if oferta.coupon is not None
+            and oferta.estimated_coupon_price is not None
+            and oferta.coupon.is_good(oferta.price)
+            and oferta.coupon.terms_verified
+            and not oferta.coupon.buyer_specific
+        ]
+        cupons.sort(
+            key=lambda oferta: oferta.estimated_coupon_price
+            or Decimal("999999999")
+        )
+        if cupons:
+            melhor = cupons[0]
+            signal_price = melhor.estimated_coupon_price or melhor.price
+            signal_id = (
+                f"coupon:{melhor.signal_id}:"
+                f"{melhor.coupon.fingerprint() if melhor.coupon else 'unknown'}"
+            )
+            tipo_sinal = "coupon"
+
+    if not tipo_sinal:
         STORE.update_pending(monitor_id, None, None, 0, checked_at)
         return "observed"
+
+    current_cents = decimal_para_centavos(signal_price)
 
     pending_item = primeiro_texto(monitor.get("pending_item_id"))
     pending_price = monitor.get("pending_price_cents")
@@ -2780,20 +4445,20 @@ def processar_monitor(
         pending_price_int = int(pending_price) if pending_price is not None else None
     except (TypeError, ValueError):
         pending_count, pending_price_int = 0, None
-    mesma_oferta = pending_item == melhor.item_id
+    mesma_oferta = pending_item == signal_id
     preco_confirmado = bool(
         pending_price_int is not None
         and current_cents <= int(Decimal(pending_price_int) * Decimal("1.01"))
     )
     confirmations = pending_count + 1 if mesma_oferta and preco_confirmado else 1
     STORE.update_pending(
-        monitor_id, melhor.item_id, current_cents, confirmations, checked_at
+        monitor_id, signal_id, current_cents, confirmations, checked_at
     )
     if confirmations < ALERT_CONFIRMATIONS:
         return "pending_confirmation"
 
     monitor_atual = STORE.get_monitor(monitor_id) or monitor
-    if not pode_realertar(monitor_atual, melhor.item_id, current_cents, checked_at):
+    if not pode_realertar(monitor_atual, signal_id, current_cents, checked_at):
         return "already_alerted"
 
     motivos = []
@@ -2801,14 +4466,17 @@ def processar_monitor(
         motivos.append("abaixo do preço-alvo")
     if history_hit:
         motivos.append("queda real no histórico")
-    texto = montar_alerta_promocao(
-        monitor_atual,
-        melhor,
-        baseline_cents,
-        history_checks,
-        motivos,
-        confirmations,
-    )
+    if tipo_sinal == "confirmed":
+        texto = montar_alerta_promocao(
+            monitor_atual,
+            melhor,
+            baseline_cents,
+            history_checks,
+            motivos,
+            confirmations,
+        )
+    else:
+        texto = montar_alerta_cupom(monitor_atual, melhor, confirmations)
     message_id = send_message(
         int(monitor["chat_id"]),
         texto,
@@ -2817,7 +4485,7 @@ def processar_monitor(
         ),
     )
     if message_id is not None:
-        STORE.mark_alert(monitor_id, melhor.item_id, current_cents, checked_at)
+        STORE.mark_alert(monitor_id, signal_id, current_cents, checked_at)
         return "alert_sent"
     return "telegram_error"
 
@@ -2927,6 +4595,9 @@ def comando_monitorar(
         f"Alvo: {html.escape(monitor_target_text(monitor))}",
         "",
         f"O alerta exige vendedor confiável e {ALERT_CONFIRMATIONS} verificações consecutivas.",
+        f"Cupons fortes (≥ {COUPON_MIN_PERCENT:g}% ou ≥ {brl(COUPON_MIN_REAIS)}) "
+        "também geram aviso quando as regras estão verificadas; o valor continua "
+        "identificado como estimativa até o carrinho.",
     ]
     if target_cents is None:
         linhas.append(
@@ -3101,9 +4772,16 @@ def pagina_oauth(
 @app.get("/")
 def home():
     status = "conectado" if TOKENS.conectado() else "aguardando OAuth"
+    prontas = [
+        SOURCE_LABELS.get(fonte, fonte.title())
+        for fonte, pronta in fontes_configuradas().items()
+        if pronta and fonte != "universal"
+    ]
     return (
         "Garimpeiro Pessoal online! 🤖"
+        f"<br>Versão: {APP_VERSION}"
         f"<br>Mercado Livre: {html.escape(status)}"
+        f"<br>Fontes prontas: {html.escape(', '.join(prontas) or 'nenhuma')}"
         "<br><a href='/health'>Health check</a>",
         200,
     )
@@ -3111,7 +4789,8 @@ def home():
 
 @app.get("/health")
 def health():
-    configurado = bool(TELEGRAM_TOKEN and MELI_CLIENT_ID and MELI_CLIENT_SECRET)
+    fontes = fontes_configuradas()
+    configurado = bool(TELEGRAM_TOKEN and any(fontes.values()))
     backend = (
         "postgresql"
         if STORE.is_postgres and STORE.available
@@ -3121,6 +4800,7 @@ def health():
     )
     return {
         "ok": True,
+        "version": APP_VERSION,
         "configured": configurado,
         "mercado_livre_connected": TOKENS.conectado(),
         "strict_configuration": STRICT_CONFIGURATION,
@@ -3128,10 +4808,64 @@ def health():
         "monitor_storage": backend,
         "monitor_storage_durable": STORE.durable,
         "active_monitors": len(STORE.list_monitors(active_only=True)),
+        "sources": fontes,
+        "coupon_alerts": COUPON_ALERTS_ENABLED,
+        "coupon_min_percent": COUPON_MIN_PERCENT,
+        "coupon_min_reais": COUPON_MIN_REAIS,
     }, 200
 
 
-@app.post("/cron/check")
+@app.get("/integrations/schema")
+def integrations_schema():
+    """Contrato estável para Buscapé, comparadores e novas lojas."""
+    return {
+        "request": {
+            "method": "GET",
+            "query": {"q": "produto", "sources": "buscape,loja", "limit": 20},
+            "authorization": "Bearer UNIVERSAL_SEARCH_API_KEY (opcional)",
+        },
+        "response": {
+            "results": [
+                {
+                    "source": "buscape",
+                    "id": "oferta-123",
+                    "product_id": "produto-123",
+                    "title": "Produto e configuração completos",
+                    "price": 5999.90,
+                    "original_price": 6999.90,
+                    "url": "https://loja.example/produto",
+                    "condition": "new",
+                    "seller": {
+                        "id": "loja-1",
+                        "name": "Loja",
+                        "rating": 4.9,
+                        "rating_count": 500,
+                        "sold_count": 2000,
+                    },
+                    "shipping": {"free": True, "cost": 0},
+                    "trusted": True,
+                    "trust_reason": "lojista verificado pelo conector",
+                    "coupon": {
+                        "id": "cupom-1",
+                        "code": "PROMO30",
+                        "discount_type": "percent",
+                        "value": 30,
+                        "min_purchase": 100,
+                        "max_discount": 500,
+                        "expires_at": "2026-12-31T23:59:59-03:00",
+                        "terms_verified": True,
+                    },
+                }
+            ]
+        },
+        "important": (
+            "trusted=true autoriza alertas automáticos; cupons continuam sujeitos "
+            "à validação no carrinho"
+        ),
+    }, 200
+
+
+@app.route("/cron/check", methods=["GET", "POST"])
 def cron_check():
     if not CRON_SECRET:
         return {"ok": False, "error": "cron_disabled"}, 503
@@ -3139,6 +4873,14 @@ def cron_check():
     authorization = request.headers.get("Authorization", "")
     if authorization.lower().startswith("bearer "):
         recebido = authorization[7:].strip()
+    # Compatibilidade com cron-job.org já configurado como GET. Cabeçalho é
+    # preferível, mas o parâmetro mantém os jobs existentes funcionando.
+    if not recebido:
+        recebido = primeiro_texto(
+            request.args.get("secret"),
+            request.args.get("token"),
+            request.args.get("cron_secret"),
+        )
     if not hmac.compare_digest(recebido, CRON_SECRET):
         return {"ok": False, "error": "forbidden"}, 403
     resumo = executar_monitores()
@@ -3280,12 +5022,14 @@ def separar_comando(texto: str) -> tuple[str, str]:
 def mensagem_inicial() -> str:
     return (
         "🤖 <b>GARIMPEIRO PESSOAL</b>\n\n"
-        "Busque qualquer produto e receba as cinco ofertas mais aderentes, com menor preço primeiro.\n\n"
+        "Busque em todas as lojas configuradas e receba as cinco ofertas compatíveis, com preço confirmado primeiro.\n\n"
         "Exemplos:\n"
         "<code>/buscar Mac Mini M4 16 GB RAM 512 GB SSD</code>\n"
-        "<code>/busca Teclado Logitech Pebble Keys 2 K380s</code>\n\n"
+        "<code>/busca Teclado Logitech Pebble Keys 2 K380s</code>\n"
+        "<code>/buscar amazon: Kindle Paperwhite</code>\n\n"
         "Monitor automático:\n"
         "<code>/monitorar Mac Mini M4 16 512 | 6300</code>\n\n"
+        "Cupons fortes são avisados separadamente e sempre exigem validação no carrinho.\n\n"
         "Comandos: /buscar, /monitorar, /monitores, /verificaragora, /parar, /historico, /status e /teste"
     )
 
@@ -3302,28 +5046,43 @@ def comando_status(chat_id: int, thread_id: Optional[int]) -> None:
         else "❌ indisponível"
     )
     monitores = len(STORE.list_monitors(chat_id=chat_id, active_only=True))
+    fontes = fontes_configuradas()
+    linhas_fontes = [
+        f"{'✅' if pronta else '⚪'} {SOURCE_LABELS.get(fonte, fonte.title())}"
+        for fonte, pronta in fontes.items()
+        if fonte != "universal"
+    ]
     send_message(
         chat_id,
         "🤖 <b>STATUS</b>\n\n"
+        f"Versão: {APP_VERSION}\n"
         "✅ Telegram\n"
         "✅ Aplicação online\n"
         f"Mercado Livre: {mercado}\n"
         f"Filtro de configuração: {modo}\n"
         f"Resultados por busca: {MAX_RESULTS}\n"
         f"Persistência: {persistencia}\n"
-        f"Monitores ativos: {monitores}",
+        f"Monitores ativos: {monitores}\n"
+        f"Cupons fortes: ≥ {COUPON_MIN_PERCENT:g}% ou ≥ {brl(COUPON_MIN_REAIS)}\n\n"
+        "<b>Fontes</b>\n"
+        + "\n".join(linhas_fontes),
         message_thread_id=thread_id,
-        reply_markup=None if TOKENS.conectado() else link_oauth_keyboard(),
+        reply_markup=(
+            None
+            if TOKENS.conectado() or any(v for k, v in fontes.items() if k != "mercadolivre")
+            else link_oauth_keyboard()
+        ),
     )
 
 
 def solicitar_busca(
     chat_id: int, thread_id: Optional[int], argumento: str
 ) -> None:
-    if not TOKENS.conectado():
+    if not any(fontes_configuradas().values()):
         send_message(
             chat_id,
-            "⚠️ <b>Mercado Livre não autorizado.</b>",
+            "⚠️ <b>Nenhuma fonte de busca está pronta.</b>\n\n"
+            "Conecte o Mercado Livre ou configure uma das integrações multiloja.",
             message_thread_id=thread_id,
             reply_markup=link_oauth_keyboard(),
         )
@@ -3346,6 +5105,22 @@ def solicitar_busca(
 
 def comando_teste(chat_id: int, thread_id: Optional[int]) -> None:
     if not TOKENS.conectado():
+        fontes = fontes_configuradas()
+        prontas = [
+            SOURCE_LABELS.get(fonte, fonte.title())
+            for fonte, pronta in fontes.items()
+            if pronta and fonte != "universal"
+        ]
+        if prontas:
+            send_message(
+                chat_id,
+                "✅ <b>INTEGRAÇÕES DISPONÍVEIS</b>\n\n"
+                + "\n".join(f"✅ {html.escape(fonte)}" for fonte in prontas)
+                + "\n⚠️ Mercado Livre ainda não autorizado.",
+                message_thread_id=thread_id,
+                reply_markup=link_oauth_keyboard(),
+            )
+            return
         send_message(
             chat_id,
             "⚠️ Mercado Livre não autorizado.",
@@ -3413,10 +5188,10 @@ def webhook():
     elif comando in {"/buscar", "/busca", "/pesquisar", "/pesquisa", "/search"}:
         solicitar_busca(chat_id, thread_id, argumento)
     elif comando == "/monitorar":
-        if not TOKENS.conectado():
+        if not any(fontes_configuradas().values()):
             send_message(
                 chat_id,
-                "⚠️ Autorize o Mercado Livre antes de criar um monitor.",
+                "⚠️ Configure ao menos uma fonte antes de criar um monitor.",
                 message_thread_id=thread_id,
                 reply_markup=link_oauth_keyboard(),
             )
